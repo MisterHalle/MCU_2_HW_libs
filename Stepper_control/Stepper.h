@@ -5,9 +5,9 @@
 
 class MotorPaso {
   private:
-    int _stepPin;
-    int _dirPin;
-    long _pasosRestantes;
+    int _stepPin, _dirPin;
+    long _posicionActual;  // Posición interna en pasos
+    long _targetPosicion;  // A dónde queremos ir
     float _currentDelay;
     float _targetDelay;
     float _alpha;
@@ -16,26 +16,19 @@ class MotorPaso {
     bool _moviendo;
 
   public:
-    // Constructor: define pines de control
     MotorPaso(int stepPin, int dirPin);
-
-    // Inicializa los pines (llamar en setup)
     void begin();
-
-    // Configura y arranca el movimiento (pasos, pasos/seg, alpha, dir)
-    void mover(long pasos, int pasosSeg, float alpha, bool dir);
-
-    // Procesa el movimiento (llamar en loop)
+    
+    // Nueva función: Define el objetivo sin detener el motor
+    void irA(long posicionObjetivo, int pasosSeg, float alpha);
+    
     void actualizar();
-
-    // Estado del motor
-    bool estaMoviendo();
-
-    // Parada de emergencia
+    long getPosicion() { return _posicionActual; }
+    void resetPosicion(long pos) { _posicionActual = pos; _targetPosicion = pos; }
+    bool estaMoviendo() { return _moviendo; }
     void stop();
 };
 
-// Función global para el pin Enable (Pin 8 en CNC Shield)
 void setMotoresGlobalEnable(bool enable);
 
 #endif
