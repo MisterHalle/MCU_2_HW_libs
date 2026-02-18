@@ -1,33 +1,82 @@
 #include "Stepper.h"
 
-MotorPaso ejeZ(4, 7);
-const int pinPot = A5;
-const float EscalarA = 1.0; // Ajusta según necesites más o menos recorrido
+MotorPaso ejeZ(4, 7, 11);
+MotorPaso ejeX(2, 5, 9);
 
 void setup() {
+  ejeX.begin();
   ejeZ.begin();
   setMotoresGlobalEnable(true);
   Serial.begin(115200);
+
+  // Calibrar eje Z usando pines 9 (Min) y 10 (Max)
+  Serial.println("Calibrando...");
+  ejeX.autoCalibrar(1000);
+  ejeZ.autoCalibrar(1000);
+  Serial.print("Rango detectado: ");
+  Serial.println(ejeZ.getLimiteMax());
+
+  ejeZ.setMaxLimit(3000); 
 }
 
+static int posX = 0, posZ = 0;
+static bool dirX = false, dirZ = false;
+static long t_x =  0, t_z = 0;
+
 void loop() {
-  // 1. Lectura con promedio simple para eliminar picos de ruido
-  static int lecturaFiltrada = 0;
-  int lecturaRaw = analogRead(pinPot);
-  
-  // Filtro básico: la lectura filtrada sigue a la raw lentamente
-  lecturaFiltrada = (lecturaFiltrada * 0.95) + (lecturaRaw * 0.05);
 
-  // 2. Aplicar un umbral de movimiento
-  static long ultimoTarget = 0;
-  long nuevoTarget = (long)(lecturaFiltrada * EscalarA);
-
-  // Si el cambio es mayor a 2 pasos, actualizamos el objetivo del motor
-  if (abs(nuevoTarget - ultimoTarget) > 6) {
-      ultimoTarget = nuevoTarget;
-      ejeZ.irA(nuevoTarget, 1000, 0.01);
+  if(millis() - t_z > 100){
+    switch(dirZ){
+      case false:
+        posZ++;
+        break;
+      case true:
+        posZ--;
+        break;
+    }
+    t_z = millis();
   }
 
-  // 3. El motor siempre debe actualizarse
+  if(millis() - t_x > 100){
+    switch(dirX){
+      case false:
+        posX++;
+        break;
+      case true:
+        posX--;
+        break;
+    }
+    t_x = millis();
+  }
+
+  if(posZ >= ejeZ.getLimiteMax()-10 || posZ <= 0 + 10){
+    dirZ = !dirZ;
+  }
+  if(posX >= ejeX.getLimiteMax()-10 || posX <= 0 + 10){
+    dirX = !dirX;
+  }
+
+  Serial.print("posX: ");
+  Serial.print(posX);
+  Serial.print("  posZ: ");
+  Serial.println(posZ);
+
+
+  // Mapear el pot al rango real descubierto
+  //long target = map((int)lecturaFiltrada, 0, 1023, 0, ejeZ.getLimiteMax());
+
+
+  ejeX.irA(posX, 1200, 0.01);
+  ejeZ.irA(posZ, 1200, 0.01);
+
+  /*
+  static long ultimoTarget = 0;
+  if (abs(target - ultimoTarget) >= 6) {
+    ultimoTarget = target;
+    ejeZ.irA(target, 1200, 0.01);
+  }
+  */
+
+  ejeX.actualizar();
   ejeZ.actualizar();
 }

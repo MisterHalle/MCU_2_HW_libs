@@ -5,9 +5,10 @@
 
 class MotorPaso {
   private:
-    int _stepPin, _dirPin;
-    long _posicionActual;  // Posición interna en pasos
-    long _targetPosicion;  // A dónde queremos ir
+    int _stepPin, _dirPin, _limitPin;
+    long _posicionActual;
+    long _targetPosicion;
+    long _limiteMax;       // Almacena el rango descubierto
     float _currentDelay;
     float _targetDelay;
     float _alpha;
@@ -16,14 +17,19 @@ class MotorPaso {
     bool _moviendo;
 
   public:
-    MotorPaso(int stepPin, int dirPin);
+    MotorPaso(int stepPin, int dirPin, int limitPin);
     void begin();
+
+    void setMaxLimit(long limite);
     
-    // Nueva función: Define el objetivo sin detener el motor
+    // Función para descubrir el rango entre dos switches
+    void autoCalibrar(int pasosSeg);
+    
     void irA(long posicionObjetivo, int pasosSeg, float alpha);
-    
     void actualizar();
+    
     long getPosicion() { return _posicionActual; }
+    long getLimiteMax() { return _limiteMax; } // Útil para el map() del pot
     void resetPosicion(long pos) { _posicionActual = pos; _targetPosicion = pos; }
     bool estaMoviendo() { return _moviendo; }
     void stop();
