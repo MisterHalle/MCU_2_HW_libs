@@ -22,25 +22,27 @@ void MotorPaso::setMaxLimit(long limite) {
 void MotorPaso::autoCalibrar(int pasosSeg) {
   //pinMode(_limitPin, INPUT_PULLUP);
   //pinMode(_limitPin, INPUT_PULLUP);
+  Serial.println("Comenzando calibracion");
   
   float delayCal = 500000.0 / pasosSeg;
   _currentDelay = delayCal; // Sincronizar delay para evitar vibración inicial
 
   // 1. BUSCAR EL MÍNIMO (Homing)
-  digitalWrite(_dirPin, LOW); // Hacia el switch MIN
-  while (digitalRead(_limitPin) == HIGH) {
+  digitalWrite(_dirPin, HIGH); // Hacia el switch MIN
+  while (digitalRead(_limitPin) == LOW) {
     digitalWrite(_stepPin, HIGH); delayMicroseconds((int)delayCal);
     digitalWrite(_stepPin, LOW);  delayMicroseconds((int)delayCal);
   }
+  Serial.println("Minimo encontrado");
   
   // Rebote para salir del switch y entrar lento (Precisión)
-  digitalWrite(_dirPin, HIGH);
-  for(int i=0; i<100; i++) {
+  digitalWrite(_dirPin, LOW);
+  for(int i=0; i<200; i++) {
     digitalWrite(_stepPin, HIGH); delayMicroseconds((int)delayCal);
     digitalWrite(_stepPin, LOW);  delayMicroseconds((int)delayCal);
   }
-  digitalWrite(_dirPin, LOW);
-  while (digitalRead(_limitPin) == HIGH) {
+  digitalWrite(_dirPin, HIGH);
+  while (digitalRead(_limitPin) == LOW) {
     digitalWrite(_stepPin, HIGH); delayMicroseconds((int)delayCal * 2);
     digitalWrite(_stepPin, LOW);  delayMicroseconds((int)delayCal * 2);
   }
@@ -50,21 +52,24 @@ void MotorPaso::autoCalibrar(int pasosSeg) {
   delay(200);
 
   // 2. BUSCAR EL MÁXIMO Y CONTAR PASOS
-  digitalWrite(_dirPin, HIGH);
+  digitalWrite(_dirPin, LOW);
   long contador = 0;
+  Serial.println("Buscando Maximo");
   
   // Salir del switch para no falsear el conteo
-  for(int i=0; i<100; i++) {
+  for(int i=0; i<200; i++) {
     digitalWrite(_stepPin, HIGH); delayMicroseconds((int)delayCal);
     digitalWrite(_stepPin, LOW);  delayMicroseconds((int)delayCal);
     contador++;
   }
 
-  while (digitalRead(_limitPin) == HIGH) {
+  while (digitalRead(_limitPin) == LOW) {
     digitalWrite(_stepPin, HIGH); delayMicroseconds((int)delayCal);
     digitalWrite(_stepPin, LOW);  delayMicroseconds((int)delayCal);
     contador++;
   }
+
+  Serial.println("Maximo encontrado");
   
   _limiteMax = contador;
   _posicionActual = contador;
@@ -72,7 +77,7 @@ void MotorPaso::autoCalibrar(int pasosSeg) {
   _moviendo = false;
 
   // Separarse un poco del switch final
-  this->irA(_limiteMax - 50, pasosSeg/2, 0.05);
+  this->irA(_limiteMax/2, pasosSeg/2, 0.01);
   while(this->estaMoviendo()) { this->actualizar(); }
 }
 
@@ -84,7 +89,7 @@ void MotorPaso::irA(long posicionObjetivo, int pasosSeg, float alpha) {
 }
 
 void MotorPaso::actualizar() {
-  if (abs(_targetPosicion - _posicionActual) < 11 || digitalRead(_limitPin)) {
+  if (abs(_targetPosicion - _posicionActual) < 11 || !digitalRead(_limitPin)) {
     if (_moviendo) {
       digitalWrite(_stepPin, LOW);
       _moviendo = false;
