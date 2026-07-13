@@ -19,8 +19,21 @@ void setup() {
   }
 
   pox.setExposureTargets(70000, 180000);
-  pox.setLedBackoffMargin(30000);
+  pox.setLedBackoffMargin(10000);
   pox.setMinLedPulseAmplitude(0x04);
+  pox.setFingerThresholds(10000, 5000);
+  pox.setSaturationThreshold(250000);
+  pox.setUsableStableSamples(24);
+  pox.setDCSettleTolerance(3000, 3000);
+  pox.enableAutoExposure(true);
+
+  pox.setHeartRateSmoothing(0.40f, 0.18f, 8.0f);
+  pox.setHeartRateTimeout(2500);
+
+  pox.setHeartRatePeakDetection(0.30f, 35.0f);
+  pox.setHeartRateHoldTimeout(5000);
+  pox.setHeartRateJumpLimit(15.0f);
+  pox.setHeartRateSmoothing(0.40f, 0.18f, 8.0f);
 
   Serial.print("PART_ID: 0x");
   Serial.println(pox.readPartID(), HEX);
@@ -44,28 +57,45 @@ void loop() {
 
   size_t n = pox.readAvailableSamples(samples, 8);
 
-  // autoajuste sobre el lote recién leído
-  bool changed = pox.autoAdjustExposure(samples, n);
+  if (n > 0) {
+    // 1) autoajuste sigue vivo
+    bool adj = pox.processSamples(samples, n);
 
-  for (size_t i = 0; i < n; i++) {
-    Serial.print(samples[i].timestampMs);
-    Serial.print(",");
-    Serial.print(samples[i].red);
-    Serial.print(",");
-    Serial.print(samples[i].ir);
-    Serial.print(",");
-    Serial.print(avail);
-    Serial.print(",");
-    Serial.print(pox.readOverflowCounter());
-    Serial.print(",adc=");
-    Serial.print(pox.getAdcRange());
-    Serial.print(",redPA=");
-    Serial.print(pox.getConfig().redLedPA);
-    Serial.print(",irPA=");
-    Serial.print(pox.getConfig().irLedPA);
-    Serial.print(",adj=");
-    Serial.println(changed ? 1 : 0);
+    for (size_t i = 0; i < n; i++) {
+      Serial.print(samples[i].timestampMs);
+      Serial.print(",");
+      Serial.print(samples[i].red);
+      Serial.print(",");
+      Serial.print(samples[i].ir);
+      Serial.print(",");
+      Serial.print(avail);
+      Serial.print(",");
+      Serial.print(pox.readOverflowCounter());
+      Serial.print(",adc=");
+      Serial.print(pox.getAdcRange());
+      Serial.print(",redPA=");
+      Serial.print(pox.getConfig().redLedPA);
+      Serial.print(",irPA=");
+      Serial.print(pox.getConfig().irLedPA);
+      Serial.print(",adj=");
+      Serial.print(adj ? 1 : 0);
+
+      Serial.print(",usable=");
+      Serial.print(pox.isSignalUsable() ? 1 : 0);
+
+      Serial.print(",HR=");
+      Serial.print(pox.getHeartRateBpm(), 1);
+
+      Serial.print(",R=");
+      Serial.print(pox.getRValue(), 4);
+
+      Serial.print(",SpO2=");
+      Serial.print(pox.getSpO2(), 1);
+
+      Serial.print(",stableN=");
+      Serial.println(pox.getStableSampleCount());
+    }
   }
 
-  delay(5);
+  delay(10);
 }

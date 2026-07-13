@@ -324,6 +324,16 @@ bool PulseOximeter::autoAdjustExposure(const Sample* samples, size_t count) {
   }
 
   unsigned long now = millis();
+
+  if (now < adjustLockUntilMs) {
+    return false;
+  }
+
+  if (freezeAutoExposureWhenUsable && signalUsable) {
+    return false;
+  }
+
+  //unsigned long now = millis();
   if ((now - lastExposureChangeMs) < exposureSettleMs) {
     return false;
   }
@@ -351,6 +361,29 @@ bool PulseOximeter::autoAdjustExposure(const Sample* samples, size_t count) {
 
   uint32_t meanLevel = (meanRed > meanIr) ? meanRed : meanIr;
   uint32_t peakLevel = (maxRed > maxIr) ? maxRed : maxIr;
+
+  bool tooHigh = (peakLevel > 250000UL) || (meanLevel > exposureHighTarget);
+  bool tooLow  = (meanLevel < exposureLowTarget);
+  bool inBand  = !tooHigh && !tooLow;
+
+  if (inBand) {
+    badExposureWindows = 0;
+    goodExposureWindows++;
+  } else {
+    goodExposureWindows = 0;
+    if (badExposureWindows < 255) {
+      badExposureWindows++;
+    }
+  }
+
+  // No cambies nada hasta ver 3 ventanas malas seguidas
+  if (!tooHigh && !tooLow) {
+    return false;
+  }
+
+  if (badExposureWindows < 3) {
+    return false;
+  }
 
   bool changed = false;
 
@@ -390,9 +423,36 @@ bool PulseOximeter::autoAdjustExposure(const Sample* samples, size_t count) {
   if (changed) {
     clearFIFO();
     lastExposureChangeMs = now;
+    adjustLockUntilMs = now + 400;   // prueba 400 ms, luego ajustas
+    stableSampleCount = 0;
+    exposureStable = false;
+    prevDCHistoryValid = false;
+    dcSettled = false;
+    badExposureWindows = 0;
+    goodExposureWindows = 0;
   }
 
   return changed;
+}
+
+bool PulseOximeter::processSamples(const Sample* samples, size_t count) {
+  if (samples == NULL || count == 0) {
+    return false;
+  }
+
+  bool adjusted = false;
+
+  if (autoExposureEnabled) {
+    adjusted = autoAdjustExposure(samples, count);
+  }
+
+  updateSignalIndicators(samples, count);
+
+  if (vitalsEnabled) {
+    updateVitals(samples, count);
+  }
+
+  return adjusted;
 }
 
 //-------------- LED power optimization
@@ -403,4 +463,381 @@ void PulseOximeter::setLedBackoffMargin(uint32_t counts) {
 
 void PulseOximeter::setMinLedPulseAmplitude(uint8_t paCode) {
   minLedPA = paCode & 0x3F;
+}
+
+//-------------- Signal Queality functions
+void PulseOximeter::setFingerThresholds(uint32_t onCounts, uint32_t offCounts) {
+  if (offCounts < onCounts) {
+    fingerOnThreshold = onCounts;
+    fingerOffThreshold = offCounts;
+  }
+}
+
+void PulseOximeter::setSaturationThreshold(uint32_t counts) {
+  saturationThreshold = counts;
+}
+
+void PulseOximeter::updateSignalIndicators(const Sample* samples, size_t count) {
+  if (samples == NULL || count == 0) {
+    return;
+  }
+
+  uint64_t sumRed = 0;
+  uint64_t sumIr = 0;
+  uint32_t maxRed = 0;
+  uint32_t maxIr = 0;
+
+  for (size_t i = 0; i < count; i++) {
+    sumRed += samples[i].red;
+    sumIr += samples[i].ir;
+
+    if (samples[i].red > maxRed) maxRed = samples[i].red;
+    if (samples[i].ir  > maxIr)  maxIr  = samples[i].ir;
+  }
+
+  redDC = (uint32_t)(sumRed / count);
+  irDC  = (uint32_t)(sumIr / count);
+
+  redPeak = maxRed;
+  irPeak = maxIr;
+
+  // 1) Finger present con histéresis sobre IR DC
+  if (!fingerPresent) {
+    if (irDC >= fingerOnThreshold) {
+      fingerPresent = true;
+    }
+  } else {
+    if (irDC <= fingerOffThreshold) {
+      fingerPresent = false;
+    }
+  }
+
+  // 2) Flags base de invalidez
+  uint8_t st1 = readStatus1();
+  alcOverflow = ((st1 & 0x20) != 0);   // ALC_OVF
+
+  saturated = (redPeak >= saturationThreshold) || (irPeak >= saturationThreshold);
+  fifoOverflow = (readOverflowCounter() != 0);
+
+  bool baseValid = fingerPresent && !alcOverflow && !saturated && !fifoOverflow;
+
+  // 3) La exposición debe estar dentro de la banda objetivo
+  uint32_t meanLevel = (redDC > irDC) ? redDC : irDC;
+  exposureInRange = (meanLevel >= exposureLowTarget) && (meanLevel <= exposureHighTarget);
+
+  // 4) La DC debe estar asentada
+  if (!prevDCHistoryValid) {
+    dcSettled = false;
+    prevDCHistoryValid = true;
+  } else {
+    uint32_t redDiff = (redDC > prevRedDC) ? (redDC - prevRedDC) : (prevRedDC - redDC);
+    uint32_t irDiff  = (irDC  > prevIrDC)  ? (irDC  - prevIrDC)  : (prevIrDC  - irDC);
+
+    dcSettled = (redDiff <= redDCSettleTol) && (irDiff <= irDCSettleTol);
+  }
+
+  prevRedDC = redDC;
+  prevIrDC = irDC;
+
+  // 5) Exposición quieta: sin cambios recientes del autoajuste
+  unsigned long now = millis();
+  bool exposureQuiet = (!autoExposureEnabled) || ((now - lastExposureChangeMs) >= exposureSettleMs);
+
+  // 6) Configuración quieta
+  bool configChanged =
+      (currentConfig.adcRange != lastStableAdcRange) ||
+      (currentConfig.redLedPA != lastStableRedPA) ||
+      (currentConfig.irLedPA  != lastStableIrPA);
+
+  bool stableConditions =
+      baseValid &&
+      exposureQuiet &&
+      exposureInRange &&
+      dcSettled &&
+      !configChanged;
+
+  if (!stableConditions) {
+    stableSampleCount = 0;
+    exposureStable = false;
+
+    lastStableAdcRange = currentConfig.adcRange;
+    lastStableRedPA = currentConfig.redLedPA;
+    lastStableIrPA = currentConfig.irLedPA;
+  } else {
+    if (stableSampleCount < 1000000UL) {
+      stableSampleCount += (uint32_t)count;
+    }
+
+    exposureStable = (stableSampleCount >= usableStableSamples);
+  }
+
+  // 7) usable final
+  signalUsable = stableConditions && exposureStable;
+}
+
+void PulseOximeter::setUsableStableSamples(uint32_t samples) {
+  if (samples > 0) {
+    usableStableSamples = samples;
+  }
+}
+
+void PulseOximeter::setDCSettleTolerance(uint32_t redTol, uint32_t irTol) {
+  redDCSettleTol = redTol;
+  irDCSettleTol = irTol;
+}
+
+//--------------- Pulsometer-Oximeter functions
+void PulseOximeter::setSpO2Coefficients(float a, float b, float c) {
+  spo2A = a;
+  spo2B = b;
+  spo2C = c;
+}
+
+void PulseOximeter::updateVitals(const Sample* samples, size_t count) {
+  if (!signalUsable) {
+    heartRateBpm = 0.0f;
+    heartRateValid = false;
+    spo2Percent = 0.0f;
+    rValue = 0.0f;
+    vitalsCount = 0;
+    vitalsHead = 0;
+    lastBeatMs = 0;
+    hrFastBeatsRemaining = 0;
+    prevSignalUsable = false;
+    return;
+  }
+
+  if (!prevSignalUsable && signalUsable) {
+    lastBeatMs = 0;
+    hrFastBeatsRemaining = 3;
+  }
+
+  prevSignalUsable = true;
+
+  pushVitalSamples(samples, count);
+
+  computeHeartRateFromBuffer();
+  computeSpO2FromBuffer();
+}
+
+void PulseOximeter::pushVitalSamples(const Sample* samples, size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    redBuf[vitalsHead] = samples[i].red;
+    irBuf[vitalsHead] = samples[i].ir;
+
+    vitalsHead = (vitalsHead + 1) % VITALS_BUF_SIZE;
+
+    if (vitalsCount < VITALS_BUF_SIZE) {
+      vitalsCount++;
+    }
+  }
+}
+
+bool PulseOximeter::computeHeartRateFromBuffer() {
+  if (vitalsCount < 32) {
+    return false;
+  }
+
+  unsigned long now = millis();
+
+  // Si pasa mucho tiempo sin latido válido, no borrar BPM.
+  // Solo marcar que el siguiente debe re-adquirirse.
+  if (lastBeatMs != 0 && (now - lastBeatMs) > hbHoldTimeoutMs) {
+    lastBeatMs = 0;
+    hrFastBeatsRemaining = 2;
+    heartRateValid = false;
+    beatIntervalCount = 0;
+    beatIntervalIndex = 0;
+    return false;
+  }
+
+  uint64_t sumIr = 0;
+  uint32_t minIr = 0xFFFFFFFF;
+  uint32_t maxIr = 0;
+
+  for (uint16_t i = 0; i < vitalsCount; i++) {
+    uint16_t idx = (vitalsHead + VITALS_BUF_SIZE - vitalsCount + i) % VITALS_BUF_SIZE;
+    uint32_t v = irBuf[idx];
+    sumIr += v;
+    if (v < minIr) minIr = v;
+    if (v > maxIr) maxIr = v;
+  }
+
+  float dcIr = (float)sumIr / vitalsCount;
+  float acThresh = (float)(maxIr - minIr) * hbPeakFactor;
+  if (acThresh < hbPeakMin) acThresh = hbPeakMin;
+
+  uint16_t idx2 = (vitalsHead + VITALS_BUF_SIZE - 1) % VITALS_BUF_SIZE;
+  uint16_t idx1 = (vitalsHead + VITALS_BUF_SIZE - 2) % VITALS_BUF_SIZE;
+  uint16_t idx0 = (vitalsHead + VITALS_BUF_SIZE - 3) % VITALS_BUF_SIZE;
+
+  float x0 = (float)irBuf[idx0] - dcIr;
+  float x1 = (float)irBuf[idx1] - dcIr;
+  float x2 = (float)irBuf[idx2] - dcIr;
+
+  bool isPeak = (x1 > x0) && (x1 > x2) && (x1 > acThresh);
+
+  if (!isPeak) {
+    return false;
+  }
+
+  if (lastBeatMs == 0) {
+    lastBeatMs = now;
+    return true;
+  }
+
+  unsigned long dt = now - lastBeatMs;
+
+  // rango fisiológico amplio: ~35 a 220 bpm
+  if (dt < 273 || dt > 1715) {
+    return false;
+  }
+
+  float bpmInstant = 60000.0f / (float)dt;
+
+  // Rechazo de cambio instantáneo demasiado brusco si ya tenemos HB válido
+  if (heartRateValid && heartRateBpm > 0.0f) {
+    float diff = fabsf(bpmInstant - heartRateBpm);
+    if (diff > hbMaxInstantJumpBpm) {
+      // ignorar este latido espurio
+      return false;
+    }
+  }
+
+  lastBeatMs = now;
+
+  // Guardar intervalo y usar mediana de 3 para robustez frente a un falso pico único
+  beatIntervalBuf[beatIntervalIndex] = dt;
+  beatIntervalIndex = (beatIntervalIndex + 1) % 3;
+  if (beatIntervalCount < 3) {
+    beatIntervalCount++;
+  }
+
+  unsigned long dtUsed = dt;
+
+  if (beatIntervalCount == 3) {
+    unsigned long a = beatIntervalBuf[0];
+    unsigned long b = beatIntervalBuf[1];
+    unsigned long c = beatIntervalBuf[2];
+
+    // mediana de 3
+    if (a > b) { unsigned long t = a; a = b; b = t; }
+    if (b > c) { unsigned long t = b; b = c; c = t; }
+    if (a > b) { unsigned long t = a; a = b; b = t; }
+
+    dtUsed = b;
+  }
+
+  float bpmFiltered = 60000.0f / (float)dtUsed;
+
+  if (heartRateBpm <= 0.0f) {
+    heartRateBpm = bpmFiltered;
+    heartRateValid = true;
+    if (hrFastBeatsRemaining > 0) {
+      hrFastBeatsRemaining--;
+    }
+    return true;
+  }
+
+  float alpha = hbAlphaSlow;
+
+  if (hrFastBeatsRemaining > 0) {
+    alpha = hbAlphaFast;
+    hrFastBeatsRemaining--;
+  }
+
+  float diff = fabsf(bpmFiltered - heartRateBpm);
+  if (diff >= hbChangeThresholdBpm) {
+    alpha = hbAlphaFast;
+  }
+
+  heartRateBpm = (1.0f - alpha) * heartRateBpm + alpha * bpmFiltered;
+  heartRateValid = true;
+  return true;
+}
+
+bool PulseOximeter::computeSpO2FromBuffer() {
+  if (vitalsCount < 64) {
+    return false;
+  }
+
+  uint64_t sumRed = 0;
+  uint64_t sumIr = 0;
+  uint32_t minRed = 0xFFFFFFFF;
+  uint32_t minIr  = 0xFFFFFFFF;
+  uint32_t maxRed = 0;
+  uint32_t maxIr  = 0;
+
+  for (uint16_t i = 0; i < vitalsCount; i++) {
+    uint16_t idx = (vitalsHead + VITALS_BUF_SIZE - vitalsCount + i) % VITALS_BUF_SIZE;
+
+    uint32_t red = redBuf[idx];
+    uint32_t ir  = irBuf[idx];
+
+    sumRed += red;
+    sumIr += ir;
+
+    if (red < minRed) minRed = red;
+    if (red > maxRed) maxRed = red;
+    if (ir < minIr) minIr = ir;
+    if (ir > maxIr) maxIr = ir;
+  }
+
+  float dcRed = (float)sumRed / vitalsCount;
+  float dcIr  = (float)sumIr / vitalsCount;
+
+  if (dcRed < 1.0f || dcIr < 1.0f) {
+    return false;
+  }
+
+  float acRed = (float)(maxRed - minRed);
+  float acIr  = (float)(maxIr - minIr);
+
+  if (acRed < 1.0f || acIr < 1.0f) {
+    return false;
+  }
+
+  rValue = (acRed / dcRed) / (acIr / dcIr);
+
+  float spo2 = spo2A * rValue * rValue + spo2B * rValue + spo2C;
+
+  if (spo2 < 70.0f) spo2 = 70.0f;
+  if (spo2 > 100.0f) spo2 = 100.0f;
+
+  if (spo2Percent <= 0.0f) {
+    spo2Percent = spo2;
+  } else {
+    spo2Percent = 0.8f * spo2Percent + 0.2f * spo2;
+  }
+
+  return true;
+}
+
+void PulseOximeter::setHeartRateSmoothing(float alphaFast, float alphaSlow, float changeThresholdBpm) {
+  if (alphaFast > 0.0f && alphaFast <= 1.0f) hbAlphaFast = alphaFast;
+  if (alphaSlow > 0.0f && alphaSlow <= 1.0f) hbAlphaSlow = alphaSlow;
+  if (changeThresholdBpm > 0.0f) hbChangeThresholdBpm = changeThresholdBpm;
+}
+
+void PulseOximeter::setHeartRateTimeout(unsigned long timeoutMs) {
+  hbTimeoutMs = timeoutMs;
+}
+
+void PulseOximeter::setHeartRatePeakDetection(float peakFactor, float peakMin) {
+  if (peakFactor > 0.05f && peakFactor < 1.0f) {
+    hbPeakFactor = peakFactor;
+  }
+  if (peakMin > 0.0f) {
+    hbPeakMin = peakMin;
+  }
+}
+
+void PulseOximeter::setHeartRateHoldTimeout(unsigned long timeoutMs) {
+  hbHoldTimeoutMs = timeoutMs;
+}
+
+void PulseOximeter::setHeartRateJumpLimit(float bpm) {
+  if (bpm > 1.0f) {
+    hbMaxInstantJumpBpm = bpm;
+  }
 }
