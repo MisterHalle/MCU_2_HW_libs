@@ -5,7 +5,7 @@
 // DW1000 register addresses
 // =====================================================
 static constexpr uint8_t REG_DEV_ID     = 0x00;
-static constexpr uint8_t REG_SYS_CFG    = 0x04;
+static constexpr uint8_t REG_SYS_config    = 0x04;
 static constexpr uint8_t REG_SYS_TIME   = 0x06;
 static constexpr uint8_t REG_TX_FCTRL   = 0x08;
 static constexpr uint8_t REG_TX_BUFFER  = 0x09;
@@ -79,6 +79,64 @@ static constexpr uint32_t STATUS_USED =
 
 static constexpr uint64_t DW1000_TIME40_MASK = 0xFFFFFFFFFFULL;
 static constexpr uint64_t DW1000_DELAYED_TX_ALIGN_MASK = ~0x1FFULL;
+
+static uint8_t txPreambleCodeFromLength(uint16_t preambleLength) {
+  switch (preambleLength) {
+    case 64:   return 0x04;
+    case 128:  return 0x14;
+    case 256:  return 0x24;
+    case 512:  return 0x34;
+    case 1024: return 0x08;
+    case 1536: return 0x18;
+    case 2048: return 0x28;
+    case 4096: return 0x0C;
+    default:   return 0x14; // 128 por seguridad
+  }
+}
+
+static uint16_t drxTune0bFromDataRate(uint8_t dataRate) {
+  switch (dataRate) {
+    case DW1000_DATA_RATE_110K:
+      return 0x0016;
+
+    case DW1000_DATA_RATE_850K:
+      return 0x0006;
+
+    case DW1000_DATA_RATE_6800K:
+    default:
+      return 0x0001;
+  }
+}
+
+static uint16_t drxTune1bFromPac(uint8_t pacSize) {
+  switch (pacSize) {
+    case 8:  return 0x0010;
+    case 16: return 0x0020;
+    case 32: return 0x0064;
+    case 64: return 0x0028;
+    default: return 0x0010;
+  }
+}
+
+static uint32_t drxTune2FromPacPrf64(uint8_t pacSize) {
+  switch (pacSize) {
+    case 8:  return 0x313B006BUL;
+    case 16: return 0x333B00BEUL;
+    case 32: return 0x353B015EUL;
+    case 64: return 0x373B0296UL;
+    default: return 0x313B006BUL;
+  }
+}
+
+static uint16_t sfdTimeoutFromProfile(uint16_t preambleLength, uint8_t pacSize, uint8_t dataRate) {
+  uint16_t sfdLength = 8;
+
+  if (dataRate == DW1000_DATA_RATE_110K) {
+    sfdLength = 64;
+  }
+
+  return preambleLength + 1 + sfdLength - pacSize;
+}
 
 // =====================================================
 // SPI helpers
@@ -316,21 +374,25 @@ bool Dw1000Driver::configure(const Dw1000Config& config) {
   _config = config;
   _antennaDelay = config.antennaDelay;
 
+  _dataRate = config.dataRate;
+  _preambleLength = config.preambleLength;
+  _pacSize = config.pacSize;
+
   forceTrxOff();
   clearAllStatus();
 
   /*
-    SYS_CFG:
+    SYS_config:
     - HIRQ_POL = 1: IRQ activo en HIGH.
     - DIS_DRXB = 1: desactiva double RX buffer para simplificar debug.
     - RXAUTR = 0: no auto-reenable por ahora.
     - FFEN = 0: frame filtering desactivado.
   */
-  uint32_t sysCfg = 0;
-  sysCfg |= (1UL << 9);   // HIRQ_POL
-  sysCfg |= (1UL << 12);  // DIS_DRXB
+  uint32_t sysconfig = 0;
+  sysconfig |= (1UL << 9);   // HIRQ_POL
+  sysconfig |= (1UL << 12);  // DIS_DRXB
 
-  writeValue(REG_SYS_CFG, NO_SUB, sysCfg, 4);
+  writeValue(REG_SYS_config, NO_SUB, sysconfig, 4);
 
   /*
     Interrupciones/eventos monitoreados.
@@ -419,82 +481,43 @@ bool Dw1000Driver::configure(const Dw1000Config& config) {
 }
 
 void Dw1000Driver::applyDefaultTuning() {
-  /*
-    Configuracion fisica usada por esta version:
+  // Perfil actual:
+  // CH5, PRF64, preamble code 9.
+  // El data rate, preamble length y PAC se eligen desde:
+  // _dataRate, _preambleLength y _pacSize.
 
-    Canal:        5
-    PRF:          64 MHz
-    Data rate:    6.8 Mbps
-    Preambulo:    128 simbolos
-    PAC size:     8
-    PreambleCode: 9
-    SFD:          estandar
-
-    El receptor ya esta viendo actividad RF, pero cae en RXSFDTO.
-    Por eso configuramos explicitamente DRX_SFDTOC.
-  */
-
-  // -------------------------
   // AGC tuning
-  // -------------------------
   writeValue(REG_AGC_TUNE, 0x04, 0x8870, 2);
   writeValue(REG_AGC_TUNE, 0x0C, 0x2502A907UL, 4);
   writeValue(REG_AGC_TUNE, 0x12, 0x0035, 2);
 
-  // -------------------------
   // DRX tuning
-  // -------------------------
+  writeValue(REG_DRX_TUNE, 0x02, drxTune0bFromDataRate(_dataRate), 2);
+  writeValue(REG_DRX_TUNE, 0x04, 0x008D, 2); // PRF64
+  writeValue(REG_DRX_TUNE, 0x06, drxTune1bFromPac(_pacSize), 2);
+  writeValue(REG_DRX_TUNE, 0x08, drxTune2FromPacPrf64(_pacSize), 4);
 
-  // DRX_TUNE0b:
-  // 6.8 Mbps + SFD estandar.
-  writeValue(REG_DRX_TUNE, 0x02, 0x0001, 2);
+  uint16_t sfdTimeout = sfdTimeoutFromProfile(_preambleLength, _pacSize, _dataRate);
+  writeValue(REG_DRX_TUNE, 0x20, sfdTimeout, 2);
 
-  // DRX_TUNE1a:
-  // RXPRF 64 MHz.
-  writeValue(REG_DRX_TUNE, 0x04, 0x008D, 2);
-
-  // DRX_TUNE1b:
-  // Preambulo 128..1024, 850 kbps / 6.8 Mbps.
-  writeValue(REG_DRX_TUNE, 0x06, 0x0020, 2);
-
-  // DRX_TUNE2:
-  // PAC8 + RXPRF 64 MHz.
-  writeValue(REG_DRX_TUNE, 0x08, 0x313B006BUL, 4);
-
-  // DRX_SFDTOC:
-  // Timeout de deteccion SFD.
-  // Para preambulo 128, SFD estandar 8 y PAC8:
-  // 128 + 1 + 8 - 8 = 129 = 0x0081.
-  writeValue(REG_DRX_TUNE, 0x20, 0x0081, 2);
-
-  // DRX_PRETOC:
-  // Preamble detection timeout.
-  // 0 = sin timeout de preambulo, util para prueba continua.
+  // Sin timeout de preambulo por ahora.
   writeValue(REG_DRX_TUNE, 0x24, 0x0000, 2);
 
-  // DRX_TUNE4H:
-  // Preambulo esperado 128 o mayor.
+  // PRF64
   writeValue(REG_DRX_TUNE, 0x26, 0x0028, 2);
 
-  // -------------------------
   // RF tuning canal 5
-  // -------------------------
   writeValue(REG_RF_CONF, 0x0B, 0xD8, 1);
   writeValue(REG_RF_CONF, 0x0C, 0x001E3FE3UL, 4);
 
-  // -------------------------
-  // TX power canal 5
-  // -------------------------
+  // TX power canal 5.
+  // Mantener por ahora para no abrir otra variable.
   writeValue(REG_TX_POWER, NO_SUB, 0x0E082848UL, 4);
 
-  // -------------------------
   // Pulse generator delay canal 5
-  // -------------------------
   writeValue(REG_TX_CAL, 0x0B, 0xC0, 1);
 
-  // -------------------------
   // PLL canal 5
-  // -------------------------
   writeValue(REG_FS_CTRL, 0x07, 0x0800041DUL, 4);
   writeValue(REG_FS_CTRL, 0x0B, 0xBE, 1);
 }
@@ -536,14 +559,6 @@ uint32_t Dw1000Driver::getSpiHz() const {
 // TX/RX
 // =====================================================
 void Dw1000Driver::writeTxFrameControl(uint16_t payloadLength) {
-  /*
-    TX_FCTRL:
-    - Frame length: payload + FCS
-    - Data rate: 6.8 Mbps
-    - TXPRF: 64 MHz
-    - Preambulo: 128 simbolos
-  */
-
   uint16_t frameLen = payloadLength + 2;
 
   if (frameLen > 127) {
@@ -555,15 +570,18 @@ void Dw1000Driver::writeTxFrameControl(uint16_t payloadLength) {
   // TXFLEN bits 0..6
   b[0] = frameLen & 0x7F;
 
-  // TXBR bits 13..14 = 2 para 6.8 Mbps.
-  b[1] |= (2 << 5);
+  // TXBR bits 13..14:
+  // 0 = 110 kbps
+  // 1 = 850 kbps
+  // 2 = 6.8 Mbps
+  b[1] |= ((_dataRate & 0x03) << 5);
 
-  // TXPRF bits 16..17 = 2 para 64 MHz.
+  // TXPRF bits 16..17:
+  // 2 = PRF 64 MHz
   b[2] |= 2;
 
-  // Preamble length 128 = 0x05.
-  // Va en los campos TXPSR + PE.
-  b[2] |= (5 << 2);
+  // Preamble length.
+  b[2] |= txPreambleCodeFromLength(_preambleLength);
 
   writeBytes(REG_TX_FCTRL, NO_SUB, b, 5);
 }

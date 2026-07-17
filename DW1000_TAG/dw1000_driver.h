@@ -16,18 +16,24 @@ struct Dw1000Pins {
   int mosi = -1;
 };
 
+enum Dw1000DataRate : uint8_t {
+  DW1000_DATA_RATE_110K  = 0,
+  DW1000_DATA_RATE_850K  = 1,
+  DW1000_DATA_RATE_6800K = 2
+};
+
 struct Dw1000Config {
   uint8_t channel = 5;
   uint8_t preambleCode = 9;
+
+  uint8_t dataRate = DW1000_DATA_RATE_6800K;
   uint16_t preambleLength = 128;
+  uint8_t pacSize = 8;
+
   uint16_t antennaDelay = 16436;
 
-  // Velocidad segura para lectura inicial DEV_ID.
   uint32_t initSpiHz = 1000000UL;
-
-  // Velocidad de trabajo inicial.
   uint32_t spiHz = 2000000UL;
-
   uint8_t spiMode = SPI_MODE0;
   bool autoDetectSpi = true;
 };
@@ -114,6 +120,10 @@ private:
 
   uint8_t _spiMode = SPI_MODE0;
   uint32_t _spiHz = 1000000UL;
+
+  uint8_t _dataRate = DW1000_DATA_RATE_6800K;
+  uint16_t _preambleLength = 128;
+  uint8_t _pacSize = 8;
 
   void select();
   void deselect();

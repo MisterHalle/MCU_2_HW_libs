@@ -71,28 +71,48 @@
 // =====================================================
 // Seleccion de rol
 // =====================================================
+
 // Para TAG:
 #define NODE_ROLE DW1000_ROLE_TAG
 
-// Para ANCHOR, comentar la linea anterior y descomentar esta:
+// Para ANCHOR:
 //#define NODE_ROLE DW1000_ROLE_ANCHOR
 
 // =====================================================
-// Configuracion DW1000
+// Perfil PHY DW1000
 // =====================================================
-static const uint16_t ANTENNA_DELAY = 16480;
+#define UWB_PROFILE_FAST_6M8_128         0
+#define UWB_PROFILE_INDOOR_6M8_1024      1
+#define UWB_PROFILE_INDOOR_850K_1024     2
 
-static const uint32_t RANGE_PERIOD_MS = 700;
-static const uint32_t RANGE_TIMEOUT_MS = 900;
+#define UWB_ACTIVE_PROFILE UWB_PROFILE_INDOOR_6M8_1024
 
-static const uint32_t RESP_DELAY_UUS   = 12000;
-static const uint32_t FINAL_DELAY_UUS  = 12000;
-static const uint32_t RESULT_DELAY_UUS = 8000;
+static const uint16_t ANTENNA_DELAY = 16445;
 
-// Si no llega lectura en este tiempo, el TAG apaga el LED.
-static const uint32_t DISTANCE_STALE_MS = 1600;
+#if UWB_ACTIVE_PROFILE == UWB_PROFILE_FAST_6M8_128
 
-// Debug apagado por defecto para consola limpia.
+  static const uint32_t RANGE_PERIOD_MS = 700;
+  static const uint32_t RANGE_TIMEOUT_MS = 900;
+
+  static const uint32_t RESP_DELAY_UUS   = 12000;
+  static const uint32_t FINAL_DELAY_UUS  = 12000;
+  static const uint32_t RESULT_DELAY_UUS = 8000;
+
+#else
+
+  // Perfil indoor con preambulo largo.
+  // Damos mas margen a los delayed TX/RX.
+  static const uint32_t RANGE_PERIOD_MS = 1000;
+  static const uint32_t RANGE_TIMEOUT_MS = 1800;
+
+  static const uint32_t RESP_DELAY_UUS   = 24000;
+  static const uint32_t FINAL_DELAY_UUS  = 24000;
+  static const uint32_t RESULT_DELAY_UUS = 16000;
+
+#endif
+
+static const uint32_t DISTANCE_STALE_MS = 2200;
+
 static bool debugEnabled = false;
 static bool outputEnabled = true;
 static bool qualityOutputEnabled = true;
@@ -100,22 +120,14 @@ static bool qualityOutputEnabled = true;
 static const uint32_t DEBUG_PERIOD_MS = 1000;
 static uint32_t lastDebugMs = 0;
 
-// Objeto principal.
 Dw1000Range dw1000Range;
 
-// Calibracion software:
-// corrected_cm = raw_cm * scale + offset_cm
 float calibrationOffsetCm = 0.0f;
 float calibrationScale = 1.0f;
 
-// Ultima distancia para LED del TAG.
 static float lastDistanceCm = 0.0f;
 static uint32_t lastDistanceMs = 0;
 static bool hasDistance = false;
-
-// LED anchor rainbow.
-static uint32_t lastAnchorLedMs = 0;
-static uint8_t anchorColorIndex = 0;
 
 // =====================================================
 // Helpers
@@ -124,12 +136,22 @@ static const char* roleName() {
   return NODE_ROLE == DW1000_ROLE_TAG ? "tag" : "anchor";
 }
 
-static void ledWritePin(uint8_t pin, bool on) {
-#if LED_ACTIVE_HIGH
-  digitalWrite(pin, on ? HIGH : LOW);
+static const char* phyProfileName() {
+#if UWB_ACTIVE_PROFILE == UWB_PROFILE_INDOOR_6M8_1024
+  return "INDOOR_6M8_PLEN1024_PAC32";
+#elif UWB_ACTIVE_PROFILE == UWB_PROFILE_INDOOR_850K_1024
+  return "INDOOR_850K_PLEN1024_PAC32";
 #else
-  digitalWrite(pin, on ? LOW : HIGH);
+  return "FAST_6M8_PLEN128_PAC8";
 #endif
+}
+
+static void ledWritePin(uint8_t pin, bool on) {
+  #if LED_ACTIVE_HIGH
+    digitalWrite(pin, on ? HIGH : LOW);
+  #else
+    digitalWrite(pin, on ? LOW : HIGH);
+  #endif
 }
 
 static void setLed(bool r, bool g, bool b) {
@@ -142,6 +164,7 @@ static bool distanceIsRecent() {
   if (!hasDistance) return false;
   return millis() - lastDistanceMs <= DISTANCE_STALE_MS;
 }
+
 
 // =====================================================
 // LED visual
@@ -246,6 +269,8 @@ static void printStatus() {
   Serial.printf("cal_offset_cm=%.2f cal_scale=%.6f\n",
                 calibrationOffsetCm,
                 calibrationScale);
+
+  Serial.printf("phy_profile=%s\n", phyProfileName());
 }
 
 static void printLastDistance() {
@@ -344,8 +369,31 @@ static void fillDw1000Config(Dw1000RangeConfig& cfg) {
 
   cfg.radio.channel = 5;
   cfg.radio.preambleCode = 9;
-  cfg.radio.preambleLength = 128;
   cfg.radio.antennaDelay = ANTENNA_DELAY;
+
+#if UWB_ACTIVE_PROFILE == UWB_PROFILE_INDOOR_6M8_1024
+
+  // Paso intermedio recomendado:
+  // Mantenemos 6.8 Mbps, pero aumentamos preambulo.
+  cfg.radio.dataRate = DW1000_DATA_RATE_6800K;
+  cfg.radio.preambleLength = 1024;
+  cfg.radio.pacSize = 32;
+
+#elif UWB_ACTIVE_PROFILE == UWB_PROFILE_INDOOR_850K_1024
+
+  // Perfil mas robusto, pero aun no validado.
+  cfg.radio.dataRate = DW1000_DATA_RATE_850K;
+  cfg.radio.preambleLength = 1024;
+  cfg.radio.pacSize = 32;
+
+#else
+
+  // Perfil base funcional.
+  cfg.radio.dataRate = DW1000_DATA_RATE_6800K;
+  cfg.radio.preambleLength = 128;
+  cfg.radio.pacSize = 8;
+
+#endif
 
   cfg.radio.initSpiHz = 1000000UL;
   cfg.radio.spiHz = 2000000UL;

@@ -412,7 +412,7 @@ void Dw1000Range::processTagRx(uint64_t rxTs, const uint8_t* frame, uint16_t len
 
 void Dw1000Range::processAnchorRx(uint64_t rxTs, const uint8_t* frame, uint16_t len) {
   _dw.readRxQuality(_lastRxQuality);
-  
+
   if (!validHeader(frame, len)) {
     return;
   }
@@ -522,6 +522,8 @@ void Dw1000Range::storeDistance(uint8_t seq, float distanceM) {
 
   _last.sequence = seq;
   _last.timestampMs = millis();
+
+  _last.quality = _lastRxQuality;
 
   _newReading = _last.valid;
 }
