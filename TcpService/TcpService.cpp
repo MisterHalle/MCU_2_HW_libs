@@ -1,9 +1,16 @@
-/*
-  TCP_SERVICE_v1.0.2
-  Archivo: TcpService.cpp
+/* Copyright 2026 Hall-e SpA
 
-  Sin nombres Halle.
-*/
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     www.apache.org
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License. */
 
 #include "TcpService.h"
 
@@ -218,7 +225,132 @@ bool TcpService::connectTcpNow() {
   return ok;
 }
 
+bool TcpService::loadWiFiPool() {
+  _wifiPoolLoaded = false;
+  _wifiPoolCount = 0;
+
+  if (!_config.useWifiPool) {
+    return false;
+  }
+
+  if (_config.wifiPoolJson == nullptr || strlen(_config.wifiPoolJson) == 0) {
+    if (_config.debug) {
+      Serial.println("[TCP_SERVICE] WiFi Pool vacio o no definido.");
+    }
+
+    return false;
+  }
+
+  StaticJsonDocument<TCP_SERVICE_WIFI_POOL_JSON_CAPACITY> wifiPool;
+
+  DeserializationError error = deserializeJson(wifiPool, _config.wifiPoolJson);
+
+  if (error) {
+    if (_config.debug) {
+      Serial.print("[TCP_SERVICE] Error cargando WiFi Pool: ");
+      Serial.println(error.c_str());
+    }
+
+    return false;
+  }
+
+  JsonObject redes = wifiPool.as<JsonObject>();
+
+  for (JsonPair red : redes) {
+    JsonArray datos = red.value().as<JsonArray>();
+
+    const char* ssid = datos[0] | "";
+    const char* pass = datos[1] | "";
+
+    if (strlen(ssid) > 0) {
+      _wifiMulti.addAP(ssid, pass);
+      _wifiPoolCount++;
+
+      if (_config.debug) {
+        Serial.print("[TCP_SERVICE][WiFi Pool] Agregada: ");
+        Serial.println(ssid);
+      }
+    }
+  }
+
+  _wifiPoolLoaded = _wifiPoolCount > 0;
+
+  if (_config.debug) {
+    Serial.print("[TCP_SERVICE][WiFi Pool] Total redes cargadas: ");
+    Serial.println(_wifiPoolCount);
+  }
+
+  return _wifiPoolLoaded;
+}
+
+bool TcpService::connectWifiFromPoolBlocking() {
+  if (!_wifiPoolLoaded) {
+    if (!loadWiFiPool()) {
+      return false;
+    }
+  }
+
+  _state = TCP_SERVICE_WIFI_CONNECTING;
+
+  if (_config.debug) {
+    Serial.println("[TCP_SERVICE] Conectando usando WiFi Pool...");
+  }
+
+  uint32_t t0 = millis();
+
+  while (millis() - t0 < _config.wifiTimeoutMs) {
+    uint8_t  status = _wifiMulti.run(_config.wifiMultiRunTimeoutMs);
+
+    if (status == WL_CONNECTED) {
+      _wifiWasConnected = true;
+      _state = TCP_SERVICE_WIFI_CONNECTED;
+
+      if (_config.debug) {
+        Serial.println();
+        Serial.println("[TCP_SERVICE] WiFi Pool conectado correctamente.");
+
+        Serial.print("[TCP_SERVICE] SSID conectado: ");
+        Serial.println(WiFi.SSID());
+
+        Serial.print("[TCP_SERVICE] IP local: ");
+        Serial.println(WiFi.localIP());
+      }
+
+      return true;
+    }
+
+    delay(100);
+    yield();
+
+    if (_config.debug) {
+      Serial.print(".");
+    }
+  }
+
+  if (_config.debug) {
+    Serial.println();
+    Serial.println("[TCP_SERVICE] Timeout conectando desde WiFi Pool.");
+  }
+
+  _wifiWasConnected = false;
+  return false;
+}
+
 bool TcpService::connectWifiBlocking() {
+  WiFi.mode(WIFI_STA);
+
+  if (_config.useWifiPool) {
+    bool poolOk = connectWifiFromPoolBlocking();
+
+    if (poolOk) {
+      return true;
+    }
+
+    if (_config.debug) {
+      Serial.println("[TCP_SERVICE] WiFi Pool fallo. Intentando ssid/pass fallback...");
+    }
+  }
+
   if (_config.ssid == nullptr || strlen(_config.ssid) == 0) {
     Serial.println("[TCP_SERVICE] SSID vacio. No se puede conectar WiFi.");
     return false;
@@ -227,7 +359,7 @@ bool TcpService::connectWifiBlocking() {
   _state = TCP_SERVICE_WIFI_CONNECTING;
 
   if (_config.debug) {
-    Serial.print("[TCP_SERVICE] Conectando a WiFi: ");
+    Serial.print("[TCP_SERVICE] Conectando a WiFi directo: ");
     Serial.println(_config.ssid);
   }
 
@@ -259,7 +391,7 @@ bool TcpService::connectWifiBlocking() {
 
   if (_config.debug) {
     Serial.println();
-    Serial.println("[TCP_SERVICE] Timeout conectando WiFi.");
+    Serial.println("[TCP_SERVICE] Timeout conectando WiFi directo.");
   }
 
   _wifiWasConnected = false;
@@ -318,8 +450,21 @@ void TcpService::updateWifi() {
     Serial.println("[TCP_SERVICE] Reintentando WiFi...");
   }
 
-  WiFi.disconnect(false);
-  WiFi.begin(_config.ssid, _config.pass, _config.wifiChannel);
+  if (_config.useWifiPool && _wifiPoolLoaded) {
+    if (_config.debug) {
+      Serial.println("[TCP_SERVICE] Reintentando WiFi desde Pool...");
+    }
+
+    _wifiMulti.run(_config.wifiMultiRunTimeoutMs);
+  } 
+  else {
+    if (_config.debug) {
+      Serial.println("[TCP_SERVICE] Reintentando WiFi directo...");
+    }
+
+    WiFi.disconnect(false);
+    WiFi.begin(_config.ssid, _config.pass, _config.wifiChannel);
+  }
 }
 
 void TcpService::startDiscoveryIfNeeded() {
@@ -345,6 +490,11 @@ void TcpService::updateDiscovery() {
   if (!_discoveryStarted) return;
 
   _discovery.update();
+
+  if (_discovery.consumeCleanRequest()) {
+    handleDiscoveryCleanRequest();
+    return;
+  }
 
   if (!_discovery.hasMaster()) {
     return;
@@ -461,4 +611,28 @@ bool TcpService::remoteEndpointValid() const {
   if (_remotePort == 0) return false;
 
   return true;
+}
+
+void TcpService::handleDiscoveryCleanRequest() {
+  if (_config.debug) {
+    Serial.println("[TCP_SERVICE] Clean UDP recibido. Reiniciando sesion TCP/discovery.");
+  }
+
+  stopTcp();
+
+  _masterReady = false;
+
+  _remoteIP = IPAddress(0, 0, 0, 0);
+  _remotePort = 0;
+
+  _nodeName = "";
+
+  _hasFireInterval = false;
+  _fireInterval = 0;
+
+  _lastTcpTryMs = 0;
+
+  _state = TCP_SERVICE_DISCOVERING;
+
+  _discovery.clearMaster();
 }

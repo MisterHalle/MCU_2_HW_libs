@@ -1,7 +1,16 @@
-/*
-  NODE_DISCOVERY_v1.4.0
-  Archivo: NodeDiscovery.cpp
-*/
+/* Copyright 2026 Hall-e SpA
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     www.apache.org
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License. */
 
 #include "NodeDiscovery.h"
 
@@ -12,6 +21,7 @@ bool NodeDiscovery::begin(const NodeDiscoveryConfig& config) {
   normalizeConfig();
 
   _hasMaster = false;
+  _cleanRequested = false;
   _masterIP = IPAddress(0, 0, 0, 0);
   _masterTcpPort = _config.defaultTcpPort;
 
@@ -22,6 +32,7 @@ bool NodeDiscovery::begin(const NodeDiscoveryConfig& config) {
 
   _beginMs = millis();
   _lastHelloMs = 0;
+  
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[DISCOVERY] WiFi no conectado. No se puede iniciar UDP.");
@@ -120,6 +131,8 @@ uint32_t NodeDiscovery::getFireInterval(uint32_t fallback) const {
 
 void NodeDiscovery::clearMaster() {
   _hasMaster = false;
+  _cleanRequested = false;
+
   _masterIP = IPAddress(0, 0, 0, 0);
   _masterTcpPort = _config.defaultTcpPort;
 
@@ -133,6 +146,20 @@ void NodeDiscovery::clearMaster() {
 
   Serial.println("[DISCOVERY] Maestro limpiado. Reiniciando busqueda UDP JSON.");
 }
+
+bool NodeDiscovery::cleanRequested() const {
+  return _cleanRequested;
+}
+
+bool NodeDiscovery::consumeCleanRequest() {
+  if (!_cleanRequested) {
+    return false;
+  }
+
+  _cleanRequested = false;
+  return true;
+}
+
 
 void NodeDiscovery::normalizeConfig() {
   if (_config.udpSendPort == 0) {
@@ -175,13 +202,12 @@ IPAddress NodeDiscovery::computeBroadcastIP() {
 
 void NodeDiscovery::sendHello() {
   StaticJsonDocument<256> doc;
-
+  //Rutina importante, sincronizar con nombres en teléfono
   doc["type"] = _config.helloType;
   doc["protocol"] = _config.protocol;
-  doc["deviceName"] = _config.deviceName;
-  doc["nodeUser"] = _config.nodeUser;
+  doc["name"] = _config.deviceName;
+  doc["user"] = _config.nodeUser;
 
-  doc["mac"] = WiFi.macAddress();
   doc["ip"] = WiFi.localIP().toString();
 
   doc["udp_send"] = _config.udpSendPort;
@@ -233,6 +259,12 @@ void NodeDiscovery::readUdpPacket() {
   Serial.print(" -> ");
   Serial.println(_rxBuffer);
 
+  if (parseCleanJson(_rxBuffer)) {
+    Serial.println("[DISCOVERY] Comando UDP clean recibido.");
+    _cleanRequested = true;
+    return;
+  }
+
   IPAddress parsedIP;
   uint16_t parsedPort = _config.defaultTcpPort;
 
@@ -279,6 +311,24 @@ void NodeDiscovery::readUdpPacket() {
       Serial.println("[DISCOVERY] fireInterval no recibido. Parametro opcional.");
     }
   }
+}
+
+bool NodeDiscovery::parseCleanJson(const char* jsonText) {
+  StaticJsonDocument<128> doc;
+
+  DeserializationError error = deserializeJson(doc, jsonText);
+
+  if (error) {
+    return false;
+  }
+
+  if (!doc.containsKey("clean")) {
+    return false;
+  }
+
+  int clean = doc["clean"] | 0;
+
+  return clean == 1;
 }
 
 bool NodeDiscovery::parseMasterJson(

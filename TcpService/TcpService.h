@@ -1,13 +1,16 @@
-/*
-  TCP_SERVICE_v1.1.0
-  Archivo: TcpService.h
+/* Copyright 2026 Hall-e SpA
 
-  Cambios:
-  - bodyPart pasa a ser nodeName.
-  - fireInterval es opcional.
-  - Se mantiene bodyPart() como alias temporal.
-  - TcpService queda como modulo TCP plug&play.
-*/
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     www.apache.org
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License. */
 
 #pragma once
 
@@ -16,6 +19,7 @@
 #include <WiFiClient.h>
 #include <ArduinoJson.h>
 #include "NodeDiscovery.h"
+#include <WiFiMulti.h>
 
 #ifndef TCP_SERVICE_RX_LINE_MAX
 #define TCP_SERVICE_RX_LINE_MAX 256
@@ -23,6 +27,10 @@
 
 #ifndef TCP_SERVICE_RX_JSON_CAPACITY
 #define TCP_SERVICE_RX_JSON_CAPACITY 256
+#endif
+
+#ifndef TCP_SERVICE_WIFI_POOL_JSON_CAPACITY
+#define TCP_SERVICE_WIFI_POOL_JSON_CAPACITY 768
 #endif
 
 enum TcpServiceMode : uint8_t {
@@ -53,6 +61,15 @@ struct TcpServiceConfig {
 
   bool wifiPersistent = false;
   bool wifiAutoReconnect = true;
+
+  // Pool opcional de redes WiFi en formato JSON.
+  // Si useWifiPool = true, TcpService intentara conectarse usando WiFiMulti.
+  // Si falla o esta desactivado, puede seguir usando ssid/pass normal.
+  bool useWifiPool = false;
+  const char* wifiPoolJson = nullptr;
+
+  // Tiempo interno de cada intento WiFiMulti.run().
+  uint32_t wifiMultiRunTimeoutMs = 1000;
 
   TcpServiceMode mode = TCP_MODE_DISCOVERY;
 
@@ -143,6 +160,14 @@ private:
   TcpServiceConfig _config;
 
   WiFiClient _client;
+  WiFiMulti _wifiMulti;
+
+  bool _wifiPoolLoaded = false;
+  uint8_t _wifiPoolCount = 0;
+
+  bool loadWiFiPool();
+  bool connectWifiFromPoolBlocking();
+
   NodeDiscovery _discovery;
 
   TcpServiceState _state = TCP_SERVICE_IDLE;
@@ -179,6 +204,8 @@ private:
   void updateDiscovery();
   void updateManualEndpoint();
   void updateTcp();
+
+  void handleDiscoveryCleanRequest();
 
   void readIncomingTcp();
   void processIncomingLine(const char* line);
