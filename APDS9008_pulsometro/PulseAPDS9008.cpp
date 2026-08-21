@@ -12,11 +12,6 @@
  See the License for the specific language governing permissions and
  limitations under the License. */
 
-/*
-  PulseAPDS9008.cpp
-  Halle / ZATA - APDS-9008 Pulsometria v0.3.0
-*/
-
 #include "PulseAPDS9008.h"
 
 PulseAPDS9008::PulseAPDS9008() {
@@ -125,6 +120,9 @@ void PulseAPDS9008::reset() {
 
   _motionEvidenceCount = 0;
   _consecutiveOutliers = 0;
+
+  _beatRearmed = true;
+  _data.beatRearmed = true;
 
   _cycleValley = 0.0f;
 
@@ -371,6 +369,43 @@ void PulseAPDS9008::processSample(
   updateState(nowMs);
   updateConfidence();
 
+  // ========================================================
+  // 6B. REARME ENTRE ONDAS
+  // ========================================================
+  //
+  // Un segundo hombro/dicrotic wave no puede iniciar otro
+  // candidato hasta que la AC pase por un valle negativo.
+  if (
+    _cfg.beatRearmEnabled &&
+    !_beatRearmed
+  ) {
+    float rearmFloor =
+      _data.noise *
+      _cfg.beatRearmNoiseFactor;
+
+    if (
+      rearmFloor <
+      _cfg.beatRearmMinAc
+    ) {
+      rearmFloor =
+        _cfg.beatRearmMinAc;
+    }
+
+    if (
+      _filteredAc <=
+      -rearmFloor
+    ) {
+      _beatRearmed = true;
+    }
+  }
+
+  if (!_cfg.beatRearmEnabled) {
+    _beatRearmed = true;
+  }
+
+  _data.beatRearmed =
+    _beatRearmed;
+
   _previousRaw =
     (float)raw;
 
@@ -463,8 +498,13 @@ void PulseAPDS9008::processSample(
     raw > _cfg.contactAdcMin &&
     raw < _cfg.contactAdcMax;
 
+  bool morphologyRearmed =
+    !_cfg.beatRearmEnabled ||
+    _beatRearmed;
+
   if (
     refractoryFinished &&
+    morphologyRearmed &&
     rising &&
     crossing &&
     adcUsable
@@ -614,9 +654,36 @@ void PulseAPDS9008::updateContact(
     _cfg.minPulseAmplitude *
     _cfg.contactEnvelopeFactor;
 
-  bool opticalVariation =
+  if (
+    contactEnvelopeFloor <
+    _cfg.contactMinEnvelope
+  ) {
+    contactEnvelopeFloor =
+      _cfg.contactMinEnvelope;
+  }
+
+  bool enoughEnvelope =
     _data.envelope >=
     contactEnvelopeFloor;
+
+  float contactSnr =
+    _data.envelope /
+    (_data.noise + 0.5f);
+
+  _data.contactSnr =
+    contactSnr;
+
+  float noiseRatio =
+    _data.noise /
+    (_data.envelope + 0.5f);
+
+  bool snrGood =
+    contactSnr >=
+    _cfg.contactMinSnr;
+
+  bool noiseRatioGood =
+    noiseRatio <=
+    _cfg.contactMaxNoiseRatio;
 
   bool cleanEnough =
     !_data.motionDetected &&
@@ -624,7 +691,9 @@ void PulseAPDS9008::updateContact(
 
   bool evidence =
     adcUsable &&
-    opticalVariation &&
+    enoughEnvelope &&
+    snrGood &&
+    noiseRatioGood &&
     cleanEnough;
 
   if (evidence) {
@@ -731,6 +800,9 @@ void PulseAPDS9008::enterState(
     _lastDetectedBeatMs = 0;
     _lastAcceptedBeatMs = 0;
 
+    _beatRearmed = true;
+    _data.beatRearmed = true;
+
     clearAcquisition();
     clearReacquisition();
 
@@ -751,6 +823,9 @@ void PulseAPDS9008::enterState(
   ) {
     _lastDetectedBeatMs = 0;
     _lastAcceptedBeatMs = 0;
+
+    _beatRearmed = true;
+    _data.beatRearmed = true;
 
     _data.bpm = 0;
     _data.ibiMs = 0;
@@ -980,10 +1055,14 @@ void PulseAPDS9008::processBeat(
   _data.prominence =
     prominence;
 
-  _lastSignalEvidenceMs =
-    peakMs;
-
-  _data.contactLikely = true;
+  // Un pico NO confirma contacto por sí solo.
+  //
+  // El contacto pertenece exclusivamente a updateContact(),
+  // evitando que ruido de mesa perpetúe contactLikely=true.
+  if (_cfg.beatRearmEnabled) {
+    _beatRearmed = false;
+    _data.beatRearmed = false;
+  }
 
   // ========================================================
   // PRIMER PICO TEMPORAL
@@ -1349,9 +1428,31 @@ bool PulseAPDS9008::acquisitionClusterReady(
     }
   }
 
+  uint8_t requiredCoherent =
+    _cfg.acquisitionMinIbi;
+
+  uint16_t candidateBpm =
+    (uint16_t)(
+      (
+        60000UL +
+        (median / 2)
+      ) /
+      median
+    );
+
   if (
-    coherent >=
-    _cfg.acquisitionMinIbi
+    candidateBpm >=
+      _cfg.highRateBpmThreshold &&
+    _cfg.highRateAcquisitionMinIbi >
+      requiredCoherent
+  ) {
+    requiredCoherent =
+      _cfg.highRateAcquisitionMinIbi;
+  }
+
+  if (
+    count >= requiredCoherent &&
+    coherent >= requiredCoherent
   ) {
     clusterMedian = median;
     return true;

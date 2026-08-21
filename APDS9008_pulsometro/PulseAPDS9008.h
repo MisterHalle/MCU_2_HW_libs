@@ -12,21 +12,6 @@
  See the License for the specific language governing permissions and
  limitations under the License. */
 
-/*
-  PulseAPDS9008.h
-  Halle / ZATA - APDS-9008 Pulsometria v0.3.0
-
-  Objetivos:
-  - deteccion PPG robusta sin sesgo por sesiones anteriores
-  - limites fisiologicos usados solo como guardrail
-  - deteccion conservadora de contacto optico
-  - deteccion de movimiento/artefactos
-  - estados NO_CONTACT / ACQUIRING / TRACKING / MOTION
-  - descarte de mediciones durante movimiento
-  - adquisicion y reacquisicion automatica del ritmo
-  - BPM basado en IBI coherentes, no en una referencia fija previa
-*/
-
 #pragma once
 
 #include <Arduino.h>
@@ -88,8 +73,22 @@ struct PulseAPDS9008Config {
   // La presencia de una variacion optica minima debe sostenerse
   // durante un tiempo para declarar contacto probable.
   float contactEnvelopeFactor = 0.35f;
-  uint16_t contactConfirmMs = 450;
-  uint16_t contactLostMs = 2200;
+
+  // Piso absoluto adicional para evitar que ruido ambiente
+  // muy pequeño sea interpretado como contacto.
+  float contactMinEnvelope = 8.0f;
+
+  // Criterios de limpieza de señal para contacto pasivo.
+  //
+  // SNR aproximado:
+  //   envelope / (noise + 0.5)
+  float contactMinSnr = 3.5f;
+
+  // noise / (envelope + 0.5)
+  float contactMaxNoiseRatio = 0.30f;
+
+  uint16_t contactConfirmMs = 850;
+  uint16_t contactLostMs = 1300;
 
   // --------------------------------------------------------
   // MOVIMIENTO / ARTEFACTO
@@ -118,10 +117,16 @@ struct PulseAPDS9008Config {
   uint16_t acquisitionSettleMs = 450;
 
   // Cantidad minima de IBI coherentes para bloquear el ritmo.
-  uint8_t acquisitionMinIbi = 3;
+  uint8_t acquisitionMinIbi = 4;
 
   // Coherencia interna durante adquisicion.
   float acquisitionTolerance = 0.22f;
+
+  // Los clusters de frecuencia alta requieren mas evidencia,
+  // ya que el doble conteo de la onda PPG puede generar un
+  // segundo armonico cercano al doble de BPM.
+  uint16_t highRateBpmThreshold = 120;
+  uint8_t highRateAcquisitionMinIbi = 5;
 
   // En tracking se permite una tolerancia algo mayor.
   float trackingIbiTolerance = 0.32f;
@@ -129,6 +134,14 @@ struct PulseAPDS9008Config {
   // Refractario dinamico:
   // max(refractario fisiologico, robustIBI * factor)
   float dynamicRefractoryFactor = 0.52f;
+
+  // Rearme morfologico entre pulsos.
+  //
+  // Tras detectar un pico, no se habilita otro candidato hasta
+  // observar un valle AC suficientemente negativo.
+  bool beatRearmEnabled = true;
+  float beatRearmMinAc = 4.0f;
+  float beatRearmNoiseFactor = 1.0f;
 
   // Si aparecen IBI coherentes pero diferentes a la referencia,
   // el sistema puede adoptar automaticamente el nuevo cluster.
@@ -156,6 +169,13 @@ struct PulseAPDS9008Data {
 
   // 0..100
   float motionScore = 0.0f;
+
+  // Diagnóstico de contacto pasivo.
+  float contactSnr = 0.0f;
+
+  // True cuando la morfología ya atravesó un valle suficiente
+  // después del último pico y puede buscar el siguiente.
+  bool beatRearmed = true;
 
   uint16_t bpm = 0;
   uint16_t ibiMs = 0;
@@ -256,6 +276,10 @@ private:
 
   uint8_t _motionEvidenceCount = 0;
   uint8_t _consecutiveOutliers = 0;
+
+  // Protección contra doble detección dentro de una misma
+  // onda PPG.
+  bool _beatRearmed = true;
 
   // Pico/candidato.
   float _cycleValley = 0.0f;

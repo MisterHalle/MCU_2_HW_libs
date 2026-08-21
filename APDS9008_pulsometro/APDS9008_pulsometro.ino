@@ -1,136 +1,301 @@
-/*
-  APDS9008_BASIC_EXAMPLE_v0.1.0
-
-  Ejemplo básico para ESP32-C3 + APDS-9008.
-
-  GPIO2 -> señal analógica APDS-9008
-  GPIO0 -> LED verde del sensor
-
-  Sin WiFi, NodeDiscovery, TCP, BQ27427, NVS,
-  botones ni deep sleep.
-*/
-
 #include <Arduino.h>
 #include "PulseAPDS9008.h"
+
+// ============================================================
+// HARDWARE
+// ============================================================
 
 #define PULSE_PIN      2
 #define PULSE_LED_PIN  0
 
+// ============================================================
+// CONFIGURACION GENERAL
+// ============================================================
+
 const uint8_t PULSE_LED_POWER = 255;
-const uint16_t PULSE_SAMPLE_INTERVAL_MS = 10;  // 100 Hz
+
+// 10 ms = 100 Hz.
+const uint16_t PULSE_SAMPLE_INTERVAL_MS = 10;
 
 // Guardrail fisiológico amplio.
-// No representa un BPM esperado.
+// NO representa un BPM esperado.
 const uint16_t PULSE_MIN_BPM = 35;
 const uint16_t PULSE_MAX_BPM = 220;
 
+// Piso mínimo AC.
 const float PULSE_MIN_AMPLITUDE = 12.0f;
+
+// Estado general cada 500 ms.
 const uint32_t SERIAL_STATUS_INTERVAL_MS = 500;
 
+// ============================================================
+// SENSOR
+// ============================================================
+
 PulseAPDS9008 pulseSensor;
+
+// ============================================================
+// CONFIGURACION DEL SENSOR
+// ============================================================
 
 void configurePulseSensor() {
   PulseAPDS9008Config cfg;
 
-  cfg.signalPin = PULSE_PIN;
-  cfg.ledPin = PULSE_LED_PIN;
-  cfg.sampleIntervalMs = PULSE_SAMPLE_INTERVAL_MS;
+  cfg.signalPin =
+    PULSE_PIN;
 
-  cfg.ledPower = PULSE_LED_POWER;
-  cfg.autoLedControl = false;
+  cfg.ledPin =
+    PULSE_LED_PIN;
 
-  cfg.minBpm = PULSE_MIN_BPM;
-  cfg.maxBpm = PULSE_MAX_BPM;
-  cfg.warmupMs = 1200;
+  cfg.sampleIntervalMs =
+    PULSE_SAMPLE_INTERVAL_MS;
 
-  cfg.minPulseAmplitude = PULSE_MIN_AMPLITUDE;
+  cfg.ledPower =
+    PULSE_LED_POWER;
 
-  // Filtros.
-  cfg.dcAlpha = 0.005f;
-  cfg.signalAlpha = 0.25f;
-  cfg.envelopeAlpha = 0.035f;
-  cfg.noiseAlpha = 0.06f;
+  cfg.autoLedControl =
+    false;
 
-  // Detector de pulso.
-  cfg.envelopeThresholdFactor = 0.35f;
-  cfg.noiseThresholdFactor = 3.5f;
-  cfg.releaseFactor = 0.25f;
+  // --------------------------------------------------------
+  // GUARDRAIL FISIOLOGICO
+  // --------------------------------------------------------
 
-  cfg.prominenceFactor = 1.15f;
-  cfg.noiseProminenceFactor = 4.0f;
-  cfg.peakFallNoiseFactor = 1.25f;
-  cfg.minPeakFall = 3.0f;
-  cfg.fallingSamplesToConfirm = 2;
-  cfg.candidateTimeoutMs = 280;
+  cfg.minBpm =
+    PULSE_MIN_BPM;
 
-  // Contacto.
-  cfg.contactAdcMin = 80;
-  cfg.contactAdcMax = 4015;
-  cfg.contactEnvelopeFactor = 0.35f;
-  cfg.contactConfirmMs = 450;
-  cfg.contactLostMs = 2200;
+  cfg.maxBpm =
+    PULSE_MAX_BPM;
 
-  // Movimiento.
-  cfg.motionRawJumpFloor = 90.0f;
-  cfg.motionAcFloor = 260.0f;
-  cfg.motionNoiseRatio = 0.55f;
-  cfg.motionConfirmSamples = 2;
-  cfg.motionHoldMs = 700;
+  cfg.warmupMs =
+    1200;
 
-  // Adquisición.
-  cfg.acquisitionSettleMs = 450;
-  cfg.acquisitionMinIbi = 3;
-  cfg.acquisitionTolerance = 0.22f;
+  cfg.minPulseAmplitude =
+    PULSE_MIN_AMPLITUDE;
 
-  // Tracking.
-  cfg.trackingIbiTolerance = 0.32f;
-  cfg.dynamicRefractoryFactor = 0.52f;
+  // --------------------------------------------------------
+  // FILTRADO
+  // --------------------------------------------------------
 
-  // Re-adquisición.
-  cfg.reacquireMinIbi = 3;
-  cfg.reacquireTolerance = 0.22f;
-  cfg.maxConsecutiveOutliers = 5;
+  cfg.dcAlpha =
+    0.005f;
 
-  cfg.signalHoldMs = 1800;
+  cfg.signalAlpha =
+    0.25f;
+
+  cfg.envelopeAlpha =
+    0.035f;
+
+  cfg.noiseAlpha =
+    0.06f;
+
+  // --------------------------------------------------------
+  // DETECTOR DE PULSO
+  // --------------------------------------------------------
+
+  cfg.envelopeThresholdFactor =
+    0.35f;
+
+  cfg.noiseThresholdFactor =
+    3.5f;
+
+  cfg.releaseFactor =
+    0.25f;
+
+  cfg.prominenceFactor =
+    1.15f;
+
+  cfg.noiseProminenceFactor =
+    4.0f;
+
+  cfg.peakFallNoiseFactor =
+    1.25f;
+
+  cfg.minPeakFall =
+    3.0f;
+
+  cfg.fallingSamplesToConfirm =
+    2;
+
+  cfg.candidateTimeoutMs =
+    280;
+
+  // --------------------------------------------------------
+  // CONTACTO OPTICO
+  // --------------------------------------------------------
+  //
+  // Más estricto que la versión básica anterior.
+  // No basta con tener envelope: también se exige buena
+  // relación señal/ruido.
+
+  cfg.contactAdcMin =
+    80;
+
+  cfg.contactAdcMax =
+    4015;
+
+  cfg.contactEnvelopeFactor =
+    0.35f;
+
+  cfg.contactMinEnvelope =
+    8.0f;
+
+  cfg.contactMinSnr =
+    3.5f;
+
+  cfg.contactMaxNoiseRatio =
+    0.30f;
+
+  cfg.contactConfirmMs =
+    850;
+
+  cfg.contactLostMs =
+    1300;
+
+  // --------------------------------------------------------
+  // MOVIMIENTO
+  // --------------------------------------------------------
+
+  cfg.motionRawJumpFloor =
+    90.0f;
+
+  cfg.motionAcFloor =
+    260.0f;
+
+  cfg.motionNoiseRatio =
+    0.55f;
+
+  cfg.motionConfirmSamples =
+    2;
+
+  cfg.motionHoldMs =
+    700;
+
+  // --------------------------------------------------------
+  // ADQUISICION
+  // --------------------------------------------------------
+
+  cfg.acquisitionSettleMs =
+    450;
+
+  cfg.acquisitionMinIbi =
+    4;
+
+  cfg.acquisitionTolerance =
+    0.22f;
+
+  // Si el cluster sugiere >=120 BPM se exige más evidencia.
+  cfg.highRateBpmThreshold =
+    120;
+
+  cfg.highRateAcquisitionMinIbi =
+    5;
+
+  // --------------------------------------------------------
+  // TRACKING
+  // --------------------------------------------------------
+
+  cfg.trackingIbiTolerance =
+    0.25f;
+
+  cfg.dynamicRefractoryFactor =
+    0.52f;
+
+  // --------------------------------------------------------
+  // REARME MORFOLOGICO
+  // --------------------------------------------------------
+  //
+  // Después de un pico, no se permite buscar otro hasta
+  // que la AC atraviese un valle negativo suficiente.
+
+  cfg.beatRearmEnabled =
+    true;
+
+  cfg.beatRearmMinAc =
+    4.0f;
+
+  cfg.beatRearmNoiseFactor =
+    1.0f;
+
+  // --------------------------------------------------------
+  // RE-ADQUISICION
+  // --------------------------------------------------------
+
+  cfg.reacquireMinIbi =
+    3;
+
+  cfg.reacquireTolerance =
+    0.22f;
+
+  cfg.maxConsecutiveOutliers =
+    5;
+
+  cfg.signalHoldMs =
+    1800;
 
   pulseSensor.begin(cfg);
 }
 
-void printBeat(const PulseAPDS9008Data& p) {
+// ============================================================
+// PRINT DE EVENTO DE PULSO
+// ============================================================
+
+void printBeat(
+  const PulseAPDS9008Data& p
+) {
   Serial.printf(
-    "PULSO #%lu | estado=%s | BPM=%u | IBI=%u ms | aceptado=%s | peak=%.1f | prom=%.1f\n",
+    "[PULSE] #%lu | state=%s | bpm=%u | ibi=%u ms | accepted=%s | "
+    "raw=%u | peak=%.1f | prom=%.1f | snr=%.2f | rearm=%s\n",
     (unsigned long)p.beatCount,
     pulseSensor.stateName(),
     p.bpm,
     p.ibiMs,
-    p.ibiAccepted ? "SI" : "NO",
+    p.ibiAccepted ? "YES" : "NO",
+    p.raw,
     p.peak,
-    p.prominence
+    p.prominence,
+    p.contactSnr,
+    p.beatRearmed ? "YES" : "NO"
   );
 }
 
-void printStatus(const PulseAPDS9008Data& p) {
+// ============================================================
+// PRINT PERIODICO
+// ============================================================
+
+void printStatus(
+  const PulseAPDS9008Data& p
+) {
   Serial.printf(
+    "[PULSE-SIGNAL] "
+    "state=%s | contact=%s | motion=%s | "
     "raw=%u | dc=%.1f | ac=%+.1f | env=%.1f | noise=%.1f | "
-    "estado=%s | contacto=%s | movimiento=%s | bpm=%u | "
-    "estable=%s | calidad=%u | confianza=%u\n",
+    "snr=%.2f | rearm=%s | bpm=%u | stable=%s | "
+    "quality=%u | confidence=%u | led=%u\n",
+    pulseSensor.stateName(),
+    p.contactLikely ? "YES" : "NO",
+    p.motionDetected ? "YES" : "NO",
     p.raw,
     p.dc,
     p.ac,
     p.envelope,
     p.noise,
-    pulseSensor.stateName(),
-    p.contactLikely ? "SI" : "NO",
-    p.motionDetected ? "SI" : "NO",
+    p.contactSnr,
+    p.beatRearmed ? "YES" : "NO",
     p.bpm,
-    p.bpmStable ? "SI" : "NO",
+    p.bpmStable ? "YES" : "NO",
     p.quality,
-    p.confidence
+    p.confidence,
+    p.ledPower
   );
 }
 
+// ============================================================
+// SETUP
+// ============================================================
+
 void setup() {
   Serial.begin(115200);
+
   delay(1000);
 
   analogReadResolution(12);
@@ -138,36 +303,92 @@ void setup() {
   configurePulseSensor();
 
   Serial.println();
-  Serial.println("==============================================");
-  Serial.println(" APDS-9008 BASIC EXAMPLE v0.1.0");
-  Serial.println("==============================================");
-  Serial.printf("ADC APDS-9008 : GPIO%d\n", PULSE_PIN);
-  Serial.printf("LED verde     : GPIO%d\n", PULSE_LED_PIN);
-  Serial.printf("LED power     : %u / 255\n", PULSE_LED_POWER);
-  Serial.printf("Sampling      : %u Hz\n", 1000 / PULSE_SAMPLE_INTERVAL_MS);
-  Serial.printf("BPM guardrail : %u - %u\n", PULSE_MIN_BPM, PULSE_MAX_BPM);
+  Serial.println("==============================================================");
+  Serial.println(" APDS-9008 BASIC EXAMPLE v0.2.0 CONTACT-GUARD");
+  Serial.println("==============================================================");
+
+  Serial.printf(
+    "ADC APDS-9008       : GPIO%d\n",
+    PULSE_PIN
+  );
+
+  Serial.printf(
+    "LED verde           : GPIO%d\n",
+    PULSE_LED_PIN
+  );
+
+  Serial.printf(
+    "LED power           : %u / 255\n",
+    PULSE_LED_POWER
+  );
+
+  Serial.printf(
+    "Sampling            : %u Hz\n",
+    1000 / PULSE_SAMPLE_INTERVAL_MS
+  );
+
+  Serial.printf(
+    "BPM guardrail       : %u - %u\n",
+    PULSE_MIN_BPM,
+    PULSE_MAX_BPM
+  );
+
+  Serial.println(
+    "Contact SNR minimo  : 3.5"
+  );
+
+  Serial.println(
+    "IBI adquisicion     : 4"
+  );
+
+  Serial.println(
+    "IBI si BPM >=120    : 5"
+  );
+
+  Serial.println(
+    "Tracking tolerance  : +/-25%"
+  );
+
   Serial.println();
-  Serial.println("Coloque el sensor sobre la zona de medicion.");
-  Serial.println("Espere a que el estado pase a TRACKING.");
-  Serial.println("==============================================");
+  Serial.println(
+    "Estados: NO_CONTACT / ACQUIRING / TRACKING / MOTION"
+  );
+
+  Serial.println(
+    "Espere TRACKING + stable=YES para considerar BPM adquirido."
+  );
+
+  Serial.println("==============================================================");
   Serial.println();
 }
+
+// ============================================================
+// LOOP
+// ============================================================
 
 void loop() {
   if (!pulseSensor.update()) {
     return;
   }
 
-  const PulseAPDS9008Data& p = pulseSensor.data();
+  const PulseAPDS9008Data& p =
+    pulseSensor.data();
 
+  // Evento de pico/pulso.
   if (p.beat) {
     printBeat(p);
   }
 
+  // Estado resumido.
   static uint32_t lastStatusMs = 0;
 
-  if (millis() - lastStatusMs >= SERIAL_STATUS_INTERVAL_MS) {
-    lastStatusMs = millis();
+  if (
+    millis() - lastStatusMs >=
+    SERIAL_STATUS_INTERVAL_MS
+  ) {
+    lastStatusMs =
+      millis();
+
     printStatus(p);
   }
 }
