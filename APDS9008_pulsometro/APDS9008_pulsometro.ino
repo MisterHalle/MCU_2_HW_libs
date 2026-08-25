@@ -29,6 +29,22 @@ const float PULSE_MIN_AMPLITUDE = 12.0f;
 const uint32_t SERIAL_STATUS_INTERVAL_MS = 500;
 
 // ============================================================
+// SALIDA SERIAL
+// ============================================================
+//
+// false -> Monitor Serial normal.
+// true  -> Arduino Serial Plotter.
+//
+// IMPORTANTE:
+// Cuando SERIAL_PLOTTER_MODE=true no se imprimen textos de
+// diagnóstico, sólo series numéricas compatibles con Plotter.
+const bool SERIAL_PLOTTER_MODE = true;
+
+// Desplazamiento visual para superponer la señal AC alrededor
+// del mismo nivel del ADC RAW/DC sin usar valores negativos.
+const float PLOTTER_AC_CENTER = 2048.0f;
+
+// ============================================================
 // SENSOR
 // ============================================================
 
@@ -290,6 +306,75 @@ void printStatus(
 }
 
 // ============================================================
+// SERIAL PLOTTER
+// ============================================================
+//
+// Series:
+//   RAW       -> ADC real.
+//   DC        -> baseline estimada.
+//   AC        -> componente pulsátil filtrada, centrada en 2048.
+//   ENV       -> envolvente, centrada en 2048.
+//   THR_POS   -> threshold positivo de detección.
+//   THR_NEG   -> espejo negativo del threshold para referencia.
+//   REARM     -> valle negativo mínimo requerido para rearmar.
+//
+// El detector inicia un candidato cuando AC supera THR_POS.
+// Después de un pico, el siguiente ciclo queda habilitado cuando
+// AC cae por debajo de REARM.
+//
+// Todas las trazas AC/ENV/THR/REARM se desplazan alrededor de
+// PLOTTER_AC_CENTER sólo para facilitar la visualización.
+
+void printPlotter(
+  const PulseAPDS9008Data& p
+) {
+  float rearmMagnitude =
+    p.noise;
+
+  if (rearmMagnitude < 4.0f) {
+    rearmMagnitude = 4.0f;
+  }
+
+  float acPlot =
+    PLOTTER_AC_CENTER + p.ac;
+
+  float envPlot =
+    PLOTTER_AC_CENTER + p.envelope;
+
+  float thresholdPositive =
+    PLOTTER_AC_CENTER + p.threshold;
+
+  float thresholdNegative =
+    PLOTTER_AC_CENTER - p.threshold;
+
+  float rearmLevel =
+    PLOTTER_AC_CENTER - rearmMagnitude;
+
+  Serial.print("RAW:");
+  Serial.print(p.raw);
+
+  Serial.print(",DC:");
+  Serial.print(p.dc, 1);
+
+  Serial.print(",AC:");
+  Serial.print(acPlot, 1);
+
+  Serial.print(",ENV:");
+  Serial.print(envPlot, 1);
+
+  Serial.print(",THR_POS:");
+  Serial.print(thresholdPositive, 1);
+
+  Serial.print(",THR_NEG:");
+  Serial.print(thresholdNegative, 1);
+
+  Serial.print(",REARM:");
+  Serial.print(rearmLevel, 1);
+
+  Serial.println();
+}
+
+// ============================================================
 // SETUP
 // ============================================================
 
@@ -302,64 +387,70 @@ void setup() {
 
   configurePulseSensor();
 
-  Serial.println();
-  Serial.println("==============================================================");
-  Serial.println(" APDS-9008 BASIC EXAMPLE v0.2.0 CONTACT-GUARD");
-  Serial.println("==============================================================");
+  if (!SERIAL_PLOTTER_MODE) {
+    Serial.println();
+    Serial.println("==============================================================");
+    Serial.println(" APDS-9008 BASIC EXAMPLE v0.2.1 PLOTTER");
+    Serial.println("==============================================================");
 
-  Serial.printf(
-    "ADC APDS-9008       : GPIO%d\n",
-    PULSE_PIN
-  );
+    Serial.printf(
+      "ADC APDS-9008       : GPIO%d\n",
+      PULSE_PIN
+    );
 
-  Serial.printf(
-    "LED verde           : GPIO%d\n",
-    PULSE_LED_PIN
-  );
+    Serial.printf(
+      "LED verde           : GPIO%d\n",
+      PULSE_LED_PIN
+    );
 
-  Serial.printf(
-    "LED power           : %u / 255\n",
-    PULSE_LED_POWER
-  );
+    Serial.printf(
+      "LED power           : %u / 255\n",
+      PULSE_LED_POWER
+    );
 
-  Serial.printf(
-    "Sampling            : %u Hz\n",
-    1000 / PULSE_SAMPLE_INTERVAL_MS
-  );
+    Serial.printf(
+      "Sampling            : %u Hz\n",
+      1000 / PULSE_SAMPLE_INTERVAL_MS
+    );
 
-  Serial.printf(
-    "BPM guardrail       : %u - %u\n",
-    PULSE_MIN_BPM,
-    PULSE_MAX_BPM
-  );
+    Serial.printf(
+      "BPM guardrail       : %u - %u\n",
+      PULSE_MIN_BPM,
+      PULSE_MAX_BPM
+    );
 
-  Serial.println(
-    "Contact SNR minimo  : 3.5"
-  );
+    Serial.println(
+      "Contact SNR minimo  : 3.5"
+    );
 
-  Serial.println(
-    "IBI adquisicion     : 4"
-  );
+    Serial.println(
+      "IBI adquisicion     : 4"
+    );
 
-  Serial.println(
-    "IBI si BPM >=120    : 5"
-  );
+    Serial.println(
+      "IBI si BPM >=120    : 5"
+    );
 
-  Serial.println(
-    "Tracking tolerance  : +/-25%"
-  );
+    Serial.println(
+      "Tracking tolerance  : +/-25%"
+    );
 
-  Serial.println();
-  Serial.println(
-    "Estados: NO_CONTACT / ACQUIRING / TRACKING / MOTION"
-  );
+    Serial.println(
+      "Serial Plotter mode : OFF"
+    );
 
-  Serial.println(
-    "Espere TRACKING + stable=YES para considerar BPM adquirido."
-  );
+    Serial.println();
+    Serial.println(
+      "Estados: NO_CONTACT / ACQUIRING / TRACKING / MOTION"
+    );
 
-  Serial.println("==============================================================");
-  Serial.println();
+    Serial.println(
+      "Espere TRACKING + stable=YES para considerar BPM adquirido."
+    );
+
+    Serial.println("==============================================================");
+    Serial.println();
+  }
 }
 
 // ============================================================
@@ -374,12 +465,25 @@ void loop() {
   const PulseAPDS9008Data& p =
     pulseSensor.data();
 
-  // Evento de pico/pulso.
+  // --------------------------------------------------------
+  // SERIAL PLOTTER
+  // --------------------------------------------------------
+  //
+  // El plotter recibe una línea en cada nueva muestra (~100 Hz)
+  // para conservar correctamente la forma de onda.
+  if (SERIAL_PLOTTER_MODE) {
+    printPlotter(p);
+    return;
+  }
+
+  // --------------------------------------------------------
+  // MONITOR SERIAL
+  // --------------------------------------------------------
+
   if (p.beat) {
     printBeat(p);
   }
 
-  // Estado resumido.
   static uint32_t lastStatusMs = 0;
 
   if (
