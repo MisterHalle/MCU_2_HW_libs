@@ -57,6 +57,8 @@ bool PulseAPDS9008::begin(
 
   applyLedPower();
 
+  configureHybridAnalyzer();
+
   reset();
 
   _startMs = millis();
@@ -74,11 +76,31 @@ bool PulseAPDS9008::update() {
 
   uint32_t nowMs = millis();
 
+  uint32_t sampleGap =
+    nowMs - _lastSampleMs;
+
   if (
-    nowMs - _lastSampleMs <
+    sampleGap <
     _cfg.sampleIntervalMs
   ) {
     return false;
+  }
+
+  if (_lastSampleMs != 0) {
+    if (sampleGap > 65535UL) {
+      sampleGap = 65535UL;
+    }
+
+    _data.sampleGapMs =
+      (uint16_t)sampleGap;
+
+    if (
+      _data.sampleGapMs >
+      _data.sampleGapMaxMs
+    ) {
+      _data.sampleGapMaxMs =
+        _data.sampleGapMs;
+    }
   }
 
   _lastSampleMs = nowMs;
@@ -131,6 +153,8 @@ void PulseAPDS9008::reset() {
   clearStableHistory();
   clearAcquisition();
   clearReacquisition();
+
+  resetHybridAnalyzer();
 
   _data.state = PULSE_STATE_NO_CONTACT;
 }
@@ -240,13 +264,55 @@ const {
   return _cfg.minPulseAmplitude;
 }
 
+uint16_t PulseAPDS9008::fusedBpm() const {
+  return _data.bpmFused;
+}
+
+uint8_t PulseAPDS9008::fusionConfidence()
+const {
+  return _data.fusionConfidence;
+}
+
+bool PulseAPDS9008::fusionValid() const {
+  return _data.fusionValid;
+}
+
 void PulseAPDS9008::processSample(
   uint16_t raw,
   uint32_t nowMs
 ) {
   _data.beat = false;
   _data.ibiAccepted = false;
+  _data.hybridUpdated = false;
   _data.raw = raw;
+
+  // El metodo IBI es el estimador legado. Se copia como una
+  // salida separada para compararlo con los otros dos metodos.
+  _data.bpmIbi =
+    _data.bpmStable
+      ? _data.bpm
+      : 0;
+
+  if (_data.bpmStable) {
+    uint8_t ibiQ =
+      _data.confidence;
+
+    if (
+      _data.quality > ibiQ
+    ) {
+      ibiQ =
+        _data.quality;
+    }
+
+    _data.ibiMethodQuality =
+      ibiQ;
+  } else {
+    _data.ibiMethodQuality = 0;
+  }
+
+  // La fusion se refresca tambien entre analisis espectrales,
+  // permitiendo reaccionar a cambios del metodo IBI.
+  updateFusion();
 
   if (!_signalInitialized) {
     _data.dc = (float)raw;
@@ -261,6 +327,9 @@ void PulseAPDS9008::processSample(
     _previousRaw = (float)raw;
 
     _cycleValley = 0.0f;
+
+    _ppgInitialized = false;
+    _data.ppgFiltered = 0.0f;
 
     _signalInitialized = true;
     return;
@@ -289,6 +358,12 @@ void PulseAPDS9008::processSample(
     (ac - _filteredAc);
 
   _data.ac = _filteredAc;
+
+  // Banda PPG paralela (~0.6-4 Hz). No reemplaza el AC legado:
+  // se usa exclusivamente para autocorrelacion/espectro.
+  updatePpgBandpass(
+    _filteredAc
+  );
 
   float slope =
     _filteredAc - previousAc;
@@ -368,6 +443,34 @@ void PulseAPDS9008::processSample(
   updateQuality(raw);
   updateState(nowMs);
   updateConfidence();
+
+  // La historia espectral solo se alimenta cuando el contacto
+  // permanece probable y no existe MOTION. Un IBI puede fallar
+  // sin borrar esta historia: esa es precisamente la redundancia.
+  if (
+    _cfg.hybridEnabled &&
+    _data.contactLikely &&
+    !_data.motionDetected
+  ) {
+    _hybridDecimationCounter++;
+
+    if (
+      _hybridDecimationCounter >=
+      _cfg.hybridDecimation
+    ) {
+      _hybridDecimationCounter = 0;
+
+      pushHybridSample(
+        _data.ppgFiltered
+      );
+    }
+
+    maybeRunHybridAnalysis(
+      nowMs
+    );
+  } else {
+    _data.fusionValid = false;
+  }
 
   // ========================================================
   // 6B. REARME ENTRE ONDAS
@@ -815,6 +918,10 @@ void PulseAPDS9008::enterState(
     _data.bpmStable = false;
 
     clearStableHistory();
+
+    // No se conserva una conclusion espectral a traves de
+    // ausencia de contacto o movimiento real.
+    resetHybridAnalyzer();
   }
 
   if (
@@ -1992,6 +2099,1708 @@ void PulseAPDS9008::updateConfidence() {
     _data.confidence >= 55;
 }
 
+
+// ============================================================
+// ANALIZADOR HIBRIDO v0.5
+// ============================================================
+
+void PulseAPDS9008::configureHybridAnalyzer() {
+  if (_cfg.hybridDecimation < 1) {
+    _cfg.hybridDecimation = 1;
+  }
+
+  if (_cfg.hybridSpectralStepBpm < 1) {
+    _cfg.hybridSpectralStepBpm = 1;
+  }
+
+  if (_cfg.hybridSpectralStepBpm > 4) {
+    _cfg.hybridSpectralStepBpm = 4;
+  }
+
+  if (_cfg.hybridSliceBudgetUs < 250) {
+    _cfg.hybridSliceBudgetUs = 250;
+  }
+
+  uint32_t hybridInterval =
+    (uint32_t)_cfg.sampleIntervalMs *
+    (uint32_t)_cfg.hybridDecimation;
+
+  if (hybridInterval > 1000UL) {
+    hybridInterval = 1000UL;
+  }
+
+  _hybridSampleIntervalMs =
+    (uint16_t)hybridInterval;
+
+  uint32_t target =
+    (uint32_t)_cfg.hybridWindowMs /
+    (uint32_t)_hybridSampleIntervalMs;
+
+  if (target < 80) {
+    target = 80;
+  }
+
+  if (target > HYBRID_BUFFER_MAX) {
+    target = HYBRID_BUFFER_MAX;
+  }
+
+  _hybridTargetSamples =
+    (uint16_t)target;
+
+  uint32_t minimum =
+    (uint32_t)_cfg.hybridMinWindowMs /
+    (uint32_t)_hybridSampleIntervalMs;
+
+  if (minimum < 60) {
+    minimum = 60;
+  }
+
+  if (minimum > target) {
+    minimum = target;
+  }
+
+  _hybridMinSamples =
+    (uint16_t)minimum;
+
+  float dt =
+    (float)_cfg.sampleIntervalMs /
+    1000.0f;
+
+  const float PULSE_TWO_PI =
+    6.28318530718f;
+
+  if (_cfg.ppgHighpassHz < 0.05f) {
+    _cfg.ppgHighpassHz = 0.05f;
+  }
+
+  if (_cfg.ppgLowpassHz < 0.5f) {
+    _cfg.ppgLowpassHz = 0.5f;
+  }
+
+  float hpRc =
+    1.0f /
+    (
+      PULSE_TWO_PI *
+      _cfg.ppgHighpassHz
+    );
+
+  _ppgHighpassAlpha =
+    hpRc /
+    (hpRc + dt);
+
+  float lpRc =
+    1.0f /
+    (
+      PULSE_TWO_PI *
+      _cfg.ppgLowpassHz
+    );
+
+  _ppgLowpassAlpha =
+    dt /
+    (lpRc + dt);
+}
+
+void PulseAPDS9008::resetHybridAnalyzer() {
+  _hybridWrite = 0;
+  _hybridCount = 0;
+  _hybridDecimationCounter = 0;
+  _lastHybridAnalysisMs = 0;
+
+  _hybridWorkStage =
+    HYBRID_WORK_IDLE;
+
+  _hybridAnalysisInProgress = false;
+  _analysisCount = 0;
+  _analysisCpuAccumUs = 0;
+  _analysisStartedMs = 0;
+
+  _ppgInitialized = false;
+  _ppgPreviousInput = 0.0f;
+  _ppgHighpass = 0.0f;
+  _ppgLowpass = 0.0f;
+
+  _data.ppgFiltered = 0.0f;
+
+  _data.bpmAutocorr = 0;
+  _data.autocorrQuality = 0;
+  _data.autocorrStrength = 0.0f;
+
+  _data.bpmSpectral = 0;
+  _data.bpmSpectralRawPeak = 0;
+  _data.spectralQuality = 0;
+  _data.spectralDominance = 0.0f;
+  _data.spectralSecondHarmonicRatio = 0.0f;
+
+  _data.bpmFused = 0;
+  _data.fusionConfidence = 0;
+  _data.methodsAgree = 0;
+  _data.fusionScore = 0.0f;
+  _data.ibiFusionRelation = 0;
+  _data.autocorrFusionRelation = 0;
+  _data.spectralFusionRelation = 0;
+
+  _data.hybridReady = false;
+  _data.hybridUpdated = false;
+  _data.hybridBusy = false;
+  _data.fusionValid = false;
+  _data.harmonicSuspect = false;
+  _data.harmonicResolved = false;
+  _data.hybridSamples = 0;
+
+  _data.hybridAnalysisUs = 0;
+  _data.hybridSliceUs = 0;
+  _data.hybridCycleElapsedMs = 0;
+}
+
+void PulseAPDS9008::updatePpgBandpass(
+  float input
+) {
+  if (!_ppgInitialized) {
+    _ppgPreviousInput = input;
+    _ppgHighpass = 0.0f;
+    _ppgLowpass = 0.0f;
+    _data.ppgFiltered = 0.0f;
+    _ppgInitialized = true;
+    return;
+  }
+
+  _ppgHighpass =
+    _ppgHighpassAlpha *
+    (
+      _ppgHighpass +
+      input -
+      _ppgPreviousInput
+    );
+
+  _ppgPreviousInput = input;
+
+  _ppgLowpass +=
+    _ppgLowpassAlpha *
+    (
+      _ppgHighpass -
+      _ppgLowpass
+    );
+
+  _data.ppgFiltered =
+    _ppgLowpass;
+}
+
+void PulseAPDS9008::pushHybridSample(
+  float value
+) {
+  if (_hybridTargetSamples == 0) {
+    return;
+  }
+
+  _hybridBuffer[
+    _hybridWrite
+  ] = value;
+
+  _hybridWrite++;
+
+  if (
+    _hybridWrite >=
+    _hybridTargetSamples
+  ) {
+    _hybridWrite = 0;
+  }
+
+  if (
+    _hybridCount <
+    _hybridTargetSamples
+  ) {
+    _hybridCount++;
+  }
+
+  _data.hybridSamples =
+    _hybridCount;
+}
+
+float PulseAPDS9008::hybridSampleAt(
+  uint16_t chronologicalIndex
+) const {
+  if (
+    chronologicalIndex >=
+    _hybridCount ||
+    _hybridCount == 0
+  ) {
+    return 0.0f;
+  }
+
+  uint16_t oldest =
+    (
+      _hybridWrite +
+      _hybridTargetSamples -
+      _hybridCount
+    ) %
+    _hybridTargetSamples;
+
+  uint16_t index =
+    oldest +
+    chronologicalIndex;
+
+  if (
+    index >=
+    _hybridTargetSamples
+  ) {
+    index -=
+      _hybridTargetSamples;
+  }
+
+  return
+    _hybridBuffer[index];
+}
+
+void PulseAPDS9008::maybeRunHybridAnalysis(
+  uint32_t nowMs
+) {
+  if (
+    !_cfg.hybridEnabled ||
+    _hybridCount <
+      _hybridMinSamples
+  ) {
+    _data.hybridReady = false;
+    return;
+  }
+
+  _data.hybridReady = true;
+
+  if (!_hybridAnalysisInProgress) {
+    bool due =
+      _lastHybridAnalysisMs == 0 ||
+      nowMs -
+      _lastHybridAnalysisMs >=
+        _cfg.hybridUpdateMs;
+
+    if (due) {
+      startHybridAnalysis(nowMs);
+    }
+  }
+
+  if (_hybridAnalysisInProgress) {
+    serviceHybridAnalysis(nowMs);
+  }
+}
+
+void PulseAPDS9008::startHybridAnalysis(
+  uint32_t nowMs
+) {
+  if (
+    _hybridCount <
+    _hybridMinSamples
+  ) {
+    return;
+  }
+
+  uint32_t startUs = micros();
+
+  _analysisCount =
+    _hybridCount;
+
+  if (
+    _analysisCount >
+    HYBRID_BUFFER_MAX
+  ) {
+    _analysisCount =
+      HYBRID_BUFFER_MAX;
+  }
+
+  float mean = 0.0f;
+
+  for (
+    uint16_t i = 0;
+    i < _analysisCount;
+    i++
+  ) {
+    float value =
+      hybridSampleAt(i);
+
+    _analysisBuffer[i] =
+      value;
+
+    mean += value;
+  }
+
+  mean /=
+    (float)_analysisCount;
+
+  for (
+    uint16_t i = 0;
+    i < _analysisCount;
+    i++
+  ) {
+    _analysisBuffer[i] -=
+      mean;
+  }
+
+  for (
+    uint16_t i = 0;
+    i <= CORR_LAG_MAX;
+    i++
+  ) {
+    _corrScores[i] = 0.0f;
+  }
+
+  for (
+    uint16_t i = 0;
+    i <= SPECTRAL_BPM_MAX;
+    i++
+  ) {
+    _spectralPowers[i] = 0.0f;
+  }
+
+  float sampleRate =
+    1000.0f /
+    (float)_hybridSampleIntervalMs;
+
+  _corrMinLag =
+    (uint16_t)(
+      sampleRate *
+      60.0f /
+      (float)_cfg.maxBpm +
+      0.5f
+    );
+
+  _corrMaxLag =
+    (uint16_t)(
+      sampleRate *
+      60.0f /
+      (float)_cfg.minBpm +
+      0.5f
+    );
+
+  if (_corrMinLag < 2) {
+    _corrMinLag = 2;
+  }
+
+  uint16_t maxAllowed =
+    _analysisCount / 2;
+
+  if (_corrMaxLag > maxAllowed) {
+    _corrMaxLag = maxAllowed;
+  }
+
+  if (_corrMaxLag > CORR_LAG_MAX) {
+    _corrMaxLag = CORR_LAG_MAX;
+  }
+
+  _corrCurrentLag =
+    _corrMinLag;
+
+  _corrGlobalBest = 0.0f;
+  _corrGlobalLag = 0;
+
+  _spectralMinBpm =
+    _cfg.minBpm;
+
+  if (_spectralMinBpm < 20) {
+    _spectralMinBpm = 20;
+  }
+
+  _spectralMaxBpm =
+    _cfg.maxBpm;
+
+  if (
+    _spectralMaxBpm >
+    SPECTRAL_BPM_MAX
+  ) {
+    _spectralMaxBpm =
+      SPECTRAL_BPM_MAX;
+  }
+
+  _spectralCurrentBpm =
+    _spectralMinBpm;
+
+  _spectralRawBestPower = 0.0f;
+  _spectralRawBestBpm = 0;
+  _spectralSumPower = 0.0f;
+  _spectralPowerCount = 0;
+
+  _hybridWorkStage =
+    HYBRID_WORK_CORRELATION;
+
+  _hybridAnalysisInProgress = true;
+  _data.hybridBusy = true;
+  _data.hybridUpdated = false;
+
+  _analysisStartedMs =
+    nowMs;
+
+  _lastHybridAnalysisMs =
+    nowMs;
+
+  _analysisCpuAccumUs =
+    micros() - startUs;
+
+  uint32_t startupUs =
+    _analysisCpuAccumUs;
+
+  if (startupUs > 65535UL) {
+    startupUs = 65535UL;
+  }
+
+  _data.hybridSliceUs =
+    (uint16_t)startupUs;
+
+  if (
+    _data.hybridSliceUs >
+    _data.hybridSliceMaxUs
+  ) {
+    _data.hybridSliceMaxUs =
+      _data.hybridSliceUs;
+  }
+}
+
+void PulseAPDS9008::serviceHybridAnalysis(
+  uint32_t nowMs
+) {
+  if (!_hybridAnalysisInProgress) {
+    return;
+  }
+
+  uint32_t sliceStartUs =
+    micros();
+
+  bool keepWorking = true;
+
+  while (keepWorking) {
+    switch (_hybridWorkStage) {
+      case HYBRID_WORK_CORRELATION:
+        if (
+          _corrCurrentLag <=
+          _corrMaxLag
+        ) {
+          processOneAutocorrelationLag();
+        } else {
+          finalizeAutocorrelation();
+          _hybridWorkStage =
+            HYBRID_WORK_PREPARE_SPECTRUM;
+          _spectralCurrentBpm = 0;
+        }
+        break;
+
+      case HYBRID_WORK_PREPARE_SPECTRUM:
+        // Reutilizamos spectralCurrentBpm como indice de preparacion.
+        if (
+          _spectralCurrentBpm <
+          _analysisCount
+        ) {
+          uint16_t i =
+            _spectralCurrentBpm;
+
+          float t =
+            (float)i /
+            (float)(
+              _analysisCount - 1
+            );
+
+          float window =
+            4.0f *
+            t *
+            (1.0f - t);
+
+          _analysisBuffer[i] *=
+            window;
+
+          _spectralCurrentBpm++;
+        } else {
+          _spectralCurrentBpm =
+            _spectralMinBpm;
+
+          _hybridWorkStage =
+            HYBRID_WORK_SPECTRUM;
+        }
+        break;
+
+      case HYBRID_WORK_SPECTRUM:
+        if (
+          _spectralCurrentBpm <=
+          _spectralMaxBpm
+        ) {
+          processOneSpectralBin();
+        } else {
+          finalizeSpectral();
+          _hybridWorkStage =
+            HYBRID_WORK_FINALIZE;
+        }
+        break;
+
+      case HYBRID_WORK_FINALIZE:
+        // Finalizamos despues de contabilizar la CPU de esta
+        // ultima rebanada, para que la telemetria sea exacta.
+        keepWorking = false;
+        break;
+
+      default:
+        _hybridAnalysisInProgress = false;
+        _data.hybridBusy = false;
+        keepWorking = false;
+        break;
+    }
+
+    if (!keepWorking) {
+      break;
+    }
+
+    uint32_t elapsed =
+      micros() -
+      sliceStartUs;
+
+    if (
+      elapsed >=
+      (uint32_t)_cfg.hybridSliceBudgetUs
+    ) {
+      break;
+    }
+  }
+
+  uint32_t sliceUs =
+    micros() -
+    sliceStartUs;
+
+  _analysisCpuAccumUs +=
+    sliceUs;
+
+  if (sliceUs > 65535UL) {
+    sliceUs = 65535UL;
+  }
+
+  _data.hybridSliceUs =
+    (uint16_t)sliceUs;
+
+  if (
+    _data.hybridSliceUs >
+    _data.hybridSliceMaxUs
+  ) {
+    _data.hybridSliceMaxUs =
+      _data.hybridSliceUs;
+  }
+
+  if (
+    _hybridAnalysisInProgress &&
+    _hybridWorkStage ==
+      HYBRID_WORK_FINALIZE
+  ) {
+    finishHybridAnalysis(nowMs);
+  }
+}
+
+void PulseAPDS9008::processOneAutocorrelationLag() {
+  uint16_t lag =
+    _corrCurrentLag;
+
+  float sumXY = 0.0f;
+  float sumXX = 0.0f;
+  float sumYY = 0.0f;
+
+  for (
+    uint16_t i = lag;
+    i < _analysisCount;
+    i++
+  ) {
+    float x =
+      _analysisBuffer[i];
+
+    float y =
+      _analysisBuffer[
+        i - lag
+      ];
+
+    sumXY += x * y;
+    sumXX += x * x;
+    sumYY += y * y;
+  }
+
+  float score = 0.0f;
+
+  if (
+    sumXY > 0.0f &&
+    sumXX > 0.0001f &&
+    sumYY > 0.0001f
+  ) {
+    score =
+      (
+        sumXY *
+        sumXY
+      ) /
+      (
+        sumXX *
+        sumYY
+      );
+  }
+
+  score =
+    clampFloat(
+      score,
+      0.0f,
+      1.0f
+    );
+
+  _corrScores[lag] =
+    score;
+
+  if (
+    score >
+    _corrGlobalBest
+  ) {
+    _corrGlobalBest =
+      score;
+
+    _corrGlobalLag =
+      lag;
+  }
+
+  _corrCurrentLag++;
+}
+
+void PulseAPDS9008::finalizeAutocorrelation() {
+  _data.bpmAutocorr = 0;
+  _data.autocorrQuality = 0;
+  _data.autocorrStrength = 0.0f;
+
+  if (
+    _corrGlobalLag == 0 ||
+    _corrGlobalBest <= 0.0f
+  ) {
+    return;
+  }
+
+  float localFloor =
+    _corrGlobalBest *
+    0.80f;
+
+  const float MINIMUM_USEFUL =
+    0.0625f; // 0.25^2
+
+  if (
+    localFloor <
+    MINIMUM_USEFUL
+  ) {
+    localFloor =
+      MINIMUM_USEFUL;
+  }
+
+  uint16_t selectedLag =
+    _corrGlobalLag;
+
+  // IMPORTANTE v0.5.3:
+  // elegimos el primer pico local plausible. Ya NO existe la
+  // antigua regla que reemplazaba T por 2T cuando 2T era mayor;
+  // esa regla produjo ~43 BPM para una señal real ~85 BPM.
+  for (
+    uint16_t lag =
+      _corrMinLag + 1;
+    lag < _corrMaxLag;
+    lag++
+  ) {
+    bool localPeak =
+      _corrScores[lag] >=
+        _corrScores[lag - 1] &&
+      _corrScores[lag] >=
+        _corrScores[lag + 1];
+
+    if (
+      localPeak &&
+      _corrScores[lag] >=
+        localFloor
+    ) {
+      selectedLag = lag;
+      break;
+    }
+  }
+
+  float selectedLagFloat =
+    (float)selectedLag;
+
+  if (
+    selectedLag > _corrMinLag &&
+    selectedLag < _corrMaxLag
+  ) {
+    float y1 =
+      _corrScores[selectedLag - 1];
+
+    float y2 =
+      _corrScores[selectedLag];
+
+    float y3 =
+      _corrScores[selectedLag + 1];
+
+    float denominator =
+      y1 -
+      2.0f * y2 +
+      y3;
+
+    if (
+      absFloat(denominator) >
+      0.000001f
+    ) {
+      float delta =
+        0.5f *
+        (y1 - y3) /
+        denominator;
+
+      if (
+        delta >= -1.0f &&
+        delta <= 1.0f
+      ) {
+        selectedLagFloat +=
+          delta;
+      }
+    }
+  }
+
+  float strength =
+    fastSqrt(
+      _corrScores[selectedLag]
+    );
+
+  float bpmFloat =
+    60000.0f /
+    (
+      selectedLagFloat *
+      (float)_hybridSampleIntervalMs
+    );
+
+  if (
+    bpmFloat <
+      (float)_cfg.minBpm ||
+    bpmFloat >
+      (float)_cfg.maxBpm
+  ) {
+    return;
+  }
+
+  _data.bpmAutocorr =
+    (uint16_t)(
+      bpmFloat +
+      0.5f
+    );
+
+  _data.autocorrStrength =
+    strength;
+
+  float q =
+    (
+      strength -
+      0.25f
+    ) /
+    0.65f;
+
+  q =
+    clampFloat(
+      q,
+      0.0f,
+      1.0f
+    );
+
+  float fill =
+    (float)_analysisCount /
+    (float)_hybridTargetSamples;
+
+  fill =
+    clampFloat(
+      fill,
+      0.0f,
+      1.0f
+    );
+
+  q *= fill;
+
+  _data.autocorrQuality =
+    (uint8_t)(
+      q *
+      100.0f +
+      0.5f
+    );
+}
+
+float PulseAPDS9008::goertzelPowerAnalysis(
+  uint16_t bpm
+) const {
+  if (
+    _analysisCount < 2 ||
+    bpm == 0
+  ) {
+    return 0.0f;
+  }
+
+  const float PULSE_TWO_PI =
+    6.28318530718f;
+
+  float omega =
+    PULSE_TWO_PI *
+    (float)bpm *
+    (float)_hybridSampleIntervalMs /
+    60000.0f;
+
+  float coefficient =
+    2.0f *
+    fastCosSmall(omega);
+
+  float s1 = 0.0f;
+  float s2 = 0.0f;
+
+  for (
+    uint16_t i = 0;
+    i < _analysisCount;
+    i++
+  ) {
+    float s0 =
+      _analysisBuffer[i] +
+      coefficient *
+      s1 -
+      s2;
+
+    s2 = s1;
+    s1 = s0;
+  }
+
+  float power =
+    s1 * s1 +
+    s2 * s2 -
+    coefficient *
+    s1 *
+    s2;
+
+  if (power < 0.0f) {
+    power = 0.0f;
+  }
+
+  return power;
+}
+
+void PulseAPDS9008::processOneSpectralBin() {
+  uint16_t candidate =
+    _spectralCurrentBpm;
+
+  float power =
+    goertzelPowerAnalysis(
+      candidate
+    );
+
+  _spectralPowers[candidate] =
+    power;
+
+  _spectralSumPower +=
+    power;
+
+  _spectralPowerCount++;
+
+  if (
+    power >
+    _spectralRawBestPower
+  ) {
+    _spectralRawBestPower =
+      power;
+
+    _spectralRawBestBpm =
+      candidate;
+  }
+
+  uint16_t next =
+    candidate +
+    _cfg.hybridSpectralStepBpm;
+
+  if (next <= candidate) {
+    next = candidate + 1;
+  }
+
+  _spectralCurrentBpm =
+    next;
+}
+
+float PulseAPDS9008::spectralPowerNear(
+  uint16_t bpm
+) const {
+  if (
+    bpm < _spectralMinBpm ||
+    bpm > _spectralMaxBpm
+  ) {
+    return 0.0f;
+  }
+
+  uint8_t radius =
+    _cfg.hybridSpectralStepBpm;
+
+  if (radius < 1) {
+    radius = 1;
+  }
+
+  float best = 0.0f;
+
+  for (
+    int16_t offset =
+      -(int16_t)radius;
+    offset <=
+      (int16_t)radius;
+    offset++
+  ) {
+    int16_t index =
+      (int16_t)bpm +
+      offset;
+
+    if (
+      index <
+        (int16_t)_spectralMinBpm ||
+      index >
+        (int16_t)_spectralMaxBpm
+    ) {
+      continue;
+    }
+
+    float value =
+      _spectralPowers[index];
+
+    if (value > best) {
+      best = value;
+    }
+  }
+
+  return best;
+}
+
+void PulseAPDS9008::finalizeSpectral() {
+  _data.bpmSpectral = 0;
+  _data.bpmSpectralRawPeak = 0;
+  _data.spectralQuality = 0;
+  _data.spectralDominance = 0.0f;
+  _data.spectralSecondHarmonicRatio = 0.0f;
+
+  if (
+    _spectralRawBestBpm == 0 ||
+    _spectralRawBestPower <= 0.0f ||
+    _spectralPowerCount == 0
+  ) {
+    return;
+  }
+
+  _data.bpmSpectralRawPeak =
+    _spectralRawBestBpm;
+
+  // El analizador espectral mantiene su propia salida, pero la
+  // decision f/2, f o 2f se deja principalmente a updateFusion().
+  // Aqui solo sumamos evidencia de familia armonica sin forzarla.
+  float bestFamilyScore = -1.0f;
+  uint16_t bestBpm =
+    _spectralRawBestBpm;
+
+  uint16_t step =
+    _cfg.hybridSpectralStepBpm;
+
+  if (step < 1) {
+    step = 1;
+  }
+
+  for (
+    uint16_t candidate =
+      _spectralMinBpm;
+    candidate <=
+      _spectralMaxBpm;
+    candidate += step
+  ) {
+    float fundamental =
+      _spectralPowers[candidate];
+
+    if (fundamental <= 0.0f) {
+      continue;
+    }
+
+    // Piso mas permisivo que v0.5.2: una fundamental debil puede
+    // coexistir con un segundo armonico dominante en PPG.
+    if (
+      fundamental <
+      _spectralRawBestPower *
+      0.08f
+    ) {
+      continue;
+    }
+
+    float score =
+      fundamental;
+
+    uint16_t h2 =
+      candidate * 2;
+
+    uint16_t h3 =
+      candidate * 3;
+
+    if (h2 <= _spectralMaxBpm) {
+      score +=
+        0.50f *
+        spectralPowerNear(h2);
+    }
+
+    if (h3 <= _spectralMaxBpm) {
+      score +=
+        0.15f *
+        spectralPowerNear(h3);
+    }
+
+    if (
+      score >
+      bestFamilyScore
+    ) {
+      bestFamilyScore = score;
+      bestBpm = candidate;
+    }
+
+    if (
+      _spectralMaxBpm - candidate < step
+    ) {
+      break;
+    }
+  }
+
+  float bpmFloat =
+    (float)bestBpm;
+
+  // Interpolacion usando el paso real del barrido.
+  if (
+    bestBpm >=
+      _spectralMinBpm + step &&
+    bestBpm + step <=
+      _spectralMaxBpm
+  ) {
+    float y1 =
+      _spectralPowers[
+        bestBpm - step
+      ];
+
+    float y2 =
+      _spectralPowers[
+        bestBpm
+      ];
+
+    float y3 =
+      _spectralPowers[
+        bestBpm + step
+      ];
+
+    float denominator =
+      y1 -
+      2.0f * y2 +
+      y3;
+
+    if (
+      absFloat(denominator) >
+      0.000001f
+    ) {
+      float deltaBins =
+        0.5f *
+        (y1 - y3) /
+        denominator;
+
+      if (
+        deltaBins >= -1.0f &&
+        deltaBins <= 1.0f
+      ) {
+        bpmFloat +=
+          deltaBins *
+          (float)step;
+      }
+    }
+  }
+
+  _data.bpmSpectral =
+    (uint16_t)(
+      bpmFloat +
+      0.5f
+    );
+
+  float averagePower =
+    _spectralSumPower /
+    (float)_spectralPowerCount;
+
+  float selectedPower =
+    spectralPowerNear(
+      bestBpm
+    );
+
+  _data.spectralDominance =
+    selectedPower /
+    (averagePower + 0.000001f);
+
+  uint16_t second =
+    bestBpm * 2;
+
+  if (
+    second <= _spectralMaxBpm &&
+    selectedPower > 0.000001f
+  ) {
+    _data.spectralSecondHarmonicRatio =
+      spectralPowerNear(second) /
+      selectedPower;
+  }
+
+  float q =
+    (
+      _data.spectralDominance -
+      2.0f
+    ) /
+    12.0f;
+
+  q =
+    clampFloat(
+      q,
+      0.0f,
+      1.0f
+    );
+
+  float fill =
+    (float)_analysisCount /
+    (float)_hybridTargetSamples;
+
+  fill =
+    clampFloat(
+      fill,
+      0.0f,
+      1.0f
+    );
+
+  q *= fill;
+
+  _data.spectralQuality =
+    (uint8_t)(
+      q *
+      100.0f +
+      0.5f
+    );
+}
+
+void PulseAPDS9008::finishHybridAnalysis(
+  uint32_t nowMs
+) {
+  updateFusion();
+
+  _hybridAnalysisInProgress = false;
+  _hybridWorkStage =
+    HYBRID_WORK_IDLE;
+
+  _data.hybridBusy = false;
+  _data.hybridUpdated = true;
+
+  _data.hybridAnalysisUs =
+    _analysisCpuAccumUs;
+
+  if (
+    _data.hybridAnalysisUs >
+    _data.hybridAnalysisMaxUs
+  ) {
+    _data.hybridAnalysisMaxUs =
+      _data.hybridAnalysisUs;
+  }
+
+  uint32_t elapsedMs =
+    nowMs -
+    _analysisStartedMs;
+
+  if (elapsedMs > 65535UL) {
+    elapsedMs = 65535UL;
+  }
+
+  _data.hybridCycleElapsedMs =
+    (uint16_t)elapsedMs;
+}
+
+bool PulseAPDS9008::bpmAgreement(
+  uint16_t a,
+  uint16_t b
+) const {
+  if (
+    a == 0 ||
+    b == 0
+  ) {
+    return false;
+  }
+
+  float average =
+    (
+      (float)a +
+      (float)b
+    ) *
+    0.5f;
+
+  float tolerance =
+    average *
+    _cfg.fusionToleranceFraction;
+
+  if (
+    tolerance <
+    (float)_cfg.fusionToleranceBpm
+  ) {
+    tolerance =
+      (float)_cfg.fusionToleranceBpm;
+  }
+
+  return
+    absFloat(
+      (float)a -
+      (float)b
+    ) <= tolerance;
+}
+
+uint8_t PulseAPDS9008::relationToHypothesis(
+  uint16_t observedBpm,
+  uint16_t hypothesisBpm,
+  float& supportFactor
+) const {
+  supportFactor = 0.0f;
+
+  if (
+    observedBpm == 0 ||
+    hypothesisBpm == 0
+  ) {
+    return 0;
+  }
+
+  const float RELATION_FACTOR[3] = {
+    0.5f,
+    1.0f,
+    2.0f
+  };
+
+  // Fundamental vale 100%; sub/segundo armonico conservan 82%.
+  const float RELATION_WEIGHT[3] = {
+    0.82f,
+    1.00f,
+    0.82f
+  };
+
+  uint8_t bestCode = 0;
+  float bestSupport = 0.0f;
+
+  for (
+    uint8_t i = 0;
+    i < 3;
+    i++
+  ) {
+    float expected =
+      (float)hypothesisBpm *
+      RELATION_FACTOR[i];
+
+    float tolerance =
+      expected *
+      _cfg.fusionToleranceFraction;
+
+    if (
+      tolerance <
+      (float)_cfg.fusionToleranceBpm
+    ) {
+      tolerance =
+        (float)_cfg.fusionToleranceBpm;
+    }
+
+    float difference =
+      absFloat(
+        (float)observedBpm -
+        expected
+      );
+
+    if (difference > tolerance) {
+      continue;
+    }
+
+    float closeness =
+      1.0f -
+      difference /
+      tolerance;
+
+    closeness =
+      clampFloat(
+        closeness,
+        0.0f,
+        1.0f
+      );
+
+    float support =
+      RELATION_WEIGHT[i] *
+      (
+        0.65f +
+        0.35f *
+        closeness
+      );
+
+    if (support > bestSupport) {
+      bestSupport = support;
+      bestCode = i + 1;
+    }
+  }
+
+  supportFactor =
+    bestSupport;
+
+  return bestCode;
+}
+
+void PulseAPDS9008::updateFusion() {
+  _data.methodsAgree = 0;
+  _data.fusionValid = false;
+  _data.harmonicSuspect = false;
+  _data.harmonicResolved = false;
+  _data.fusionScore = 0.0f;
+  _data.ibiFusionRelation = 0;
+  _data.autocorrFusionRelation = 0;
+  _data.spectralFusionRelation = 0;
+
+  bool contextValid =
+    _data.contactLikely &&
+    !_data.motionDetected;
+
+  if (!contextValid) {
+    _data.bpmFused = 0;
+    _data.fusionConfidence = 0;
+    return;
+  }
+
+  bool ibiAvailable =
+    _data.bpmIbi > 0 &&
+    _data.ibiMethodQuality > 0;
+
+  bool corrAvailable =
+    _data.bpmAutocorr > 0 &&
+    _data.autocorrQuality >=
+      _cfg.autocorrMinQuality;
+
+  bool specAvailable =
+    _data.bpmSpectral > 0 &&
+    _data.spectralQuality >=
+      _cfg.spectralMinQuality;
+
+  if (
+    !ibiAvailable &&
+    !corrAvailable &&
+    !specAvailable
+  ) {
+    _data.bpmFused = 0;
+    _data.fusionConfidence = 0;
+    return;
+  }
+
+  // Maximo 3 metodos x {2x,1x,0.5x} = 9 hipotesis.
+  uint16_t hypotheses[9] = {0};
+  uint8_t hypothesisCount = 0;
+
+  uint16_t observations[3] = {
+    (uint16_t)(
+      ibiAvailable
+        ? _data.bpmIbi
+        : 0
+    ),
+    (uint16_t)(
+      corrAvailable
+        ? _data.bpmAutocorr
+        : 0
+    ),
+    (uint16_t)(
+      specAvailable
+        ? _data.bpmSpectral
+        : 0
+    )
+  };
+
+  for (
+    uint8_t method = 0;
+    method < 3;
+    method++
+  ) {
+    uint16_t observed =
+      observations[method];
+
+    if (observed == 0) {
+      continue;
+    }
+
+    uint16_t candidates[3] = {
+      observed,
+      (uint16_t)(
+        observed <= 32767
+          ? observed * 2
+          : 65535
+      ),
+      (uint16_t)(
+        observed / 2
+      )
+    };
+
+    for (
+      uint8_t c = 0;
+      c < 3;
+      c++
+    ) {
+      uint16_t candidate =
+        candidates[c];
+
+      if (
+        candidate < _cfg.minBpm ||
+        candidate > _cfg.maxBpm
+      ) {
+        continue;
+      }
+
+      bool duplicate = false;
+
+      for (
+        uint8_t i = 0;
+        i < hypothesisCount;
+        i++
+      ) {
+        if (
+          absFloat(
+            (float)hypotheses[i] -
+            (float)candidate
+          ) <= 1.0f
+        ) {
+          duplicate = true;
+          break;
+        }
+      }
+
+      if (
+        !duplicate &&
+        hypothesisCount < 9
+      ) {
+        hypotheses[
+          hypothesisCount++
+        ] = candidate;
+      }
+    }
+  }
+
+  uint8_t bestMethods = 0;
+  uint8_t bestFundamentals = 0;
+  float bestScore = -1.0f;
+  uint16_t bestHypothesis = 0;
+  uint8_t bestRelations[3] = {0,0,0};
+  float bestSupports[3] = {0.0f,0.0f,0.0f};
+
+  uint8_t qualities[3] = {
+    _data.ibiMethodQuality,
+    _data.autocorrQuality,
+    _data.spectralQuality
+  };
+
+  bool available[3] = {
+    ibiAvailable,
+    corrAvailable,
+    specAvailable
+  };
+
+  for (
+    uint8_t h = 0;
+    h < hypothesisCount;
+    h++
+  ) {
+    uint16_t hypothesis =
+      hypotheses[h];
+
+    uint8_t supportMethods = 0;
+    uint8_t fundamentalMethods = 0;
+    float score = 0.0f;
+    uint8_t relations[3] = {0,0,0};
+    float supports[3] = {0.0f,0.0f,0.0f};
+
+    for (
+      uint8_t method = 0;
+      method < 3;
+      method++
+    ) {
+      if (!available[method]) {
+        continue;
+      }
+
+      float supportFactor = 0.0f;
+
+      uint8_t relation =
+        relationToHypothesis(
+          observations[method],
+          hypothesis,
+          supportFactor
+        );
+
+      if (relation == 0) {
+        continue;
+      }
+
+      relations[method] = relation;
+      supports[method] = supportFactor;
+      supportMethods++;
+
+      if (relation == 2) {
+        fundamentalMethods++;
+      }
+
+      score +=
+        (float)qualities[method] *
+        supportFactor;
+    }
+
+    bool better = false;
+
+    // Primero manda redundancia: 3 metodos > 2 > 1.
+    if (supportMethods > bestMethods) {
+      better = true;
+    } else if (
+      supportMethods == bestMethods &&
+      score > bestScore + 0.01f
+    ) {
+      better = true;
+    } else if (
+      supportMethods == bestMethods &&
+      absFloat(score - bestScore) <= 0.01f &&
+      fundamentalMethods > bestFundamentals
+    ) {
+      better = true;
+    }
+
+    if (better) {
+      bestMethods = supportMethods;
+      bestFundamentals = fundamentalMethods;
+      bestScore = score;
+      bestHypothesis = hypothesis;
+
+      for (
+        uint8_t i = 0;
+        i < 3;
+        i++
+      ) {
+        bestRelations[i] =
+          relations[i];
+
+        bestSupports[i] =
+          supports[i];
+      }
+    }
+  }
+
+  if (
+    bestMethods < 2 ||
+    bestHypothesis == 0
+  ) {
+    _data.bpmFused = 0;
+    _data.fusionConfidence = 0;
+    return;
+  }
+
+  // Convertimos cada observacion respaldante a la escala de la
+  // hipotesis antes de promediar. Ej.: 43@0.5x -> 86 BPM.
+  float weightedBpm = 0.0f;
+  float weightSum = 0.0f;
+  float confidenceSum = 0.0f;
+
+  for (
+    uint8_t method = 0;
+    method < 3;
+    method++
+  ) {
+    uint8_t relation =
+      bestRelations[method];
+
+    if (relation == 0) {
+      continue;
+    }
+
+    float relationFactor = 1.0f;
+
+    if (relation == 1) {
+      relationFactor = 0.5f;
+    } else if (relation == 3) {
+      relationFactor = 2.0f;
+    }
+
+    float normalizedBpm =
+      (float)observations[method] /
+      relationFactor;
+
+    float methodWeight =
+      (float)qualities[method] *
+      bestSupports[method];
+
+    weightedBpm +=
+      normalizedBpm *
+      methodWeight;
+
+    weightSum +=
+      methodWeight;
+
+    confidenceSum +=
+      methodWeight;
+  }
+
+  if (weightSum <= 0.0f) {
+    _data.bpmFused = 0;
+    _data.fusionConfidence = 0;
+    return;
+  }
+
+  float fusedFloat =
+    weightedBpm /
+    weightSum;
+
+  _data.bpmFused =
+    (uint16_t)(
+      fusedFloat +
+      0.5f
+    );
+
+  _data.methodsAgree =
+    bestMethods;
+
+  _data.fusionScore =
+    bestScore;
+
+  _data.ibiFusionRelation =
+    bestRelations[0];
+
+  _data.autocorrFusionRelation =
+    bestRelations[1];
+
+  _data.spectralFusionRelation =
+    bestRelations[2];
+
+  _data.harmonicSuspect =
+    (
+      bestRelations[0] != 0 &&
+      bestRelations[0] != 2
+    ) ||
+    (
+      bestRelations[1] != 0 &&
+      bestRelations[1] != 2
+    ) ||
+    (
+      bestRelations[2] != 0 &&
+      bestRelations[2] != 2
+    );
+
+  float confidence =
+    confidenceSum /
+    (float)bestMethods;
+
+  if (bestMethods == 3) {
+    confidence += 10.0f;
+  }
+
+  confidence =
+    clampFloat(
+      confidence,
+      0.0f,
+      100.0f
+    );
+
+  _data.fusionConfidence =
+    (uint8_t)(
+      confidence +
+      0.5f
+    );
+
+  _data.fusionValid =
+    _data.fusionConfidence >=
+      _cfg.fusionMinConfidence;
+
+  _data.harmonicResolved =
+    _data.fusionValid &&
+    _data.harmonicSuspect;
+}
+
 void PulseAPDS9008::applyLedPower() {
   analogWrite(
     _cfg.ledPin,
@@ -2006,6 +3815,60 @@ float PulseAPDS9008::absFloat(
     value < 0.0f
       ? -value
       : value;
+}
+
+float PulseAPDS9008::fastSqrt(
+  float value
+) {
+  if (value <= 0.0f) {
+    return 0.0f;
+  }
+
+  float x =
+    value >= 1.0f
+      ? value
+      : 1.0f;
+
+  for (
+    uint8_t i = 0;
+    i < 7;
+    i++
+  ) {
+    x =
+      0.5f *
+      (
+        x +
+        value / x
+      );
+  }
+
+  return x;
+}
+
+float PulseAPDS9008::fastCosSmall(
+  float radians
+) {
+  // Para nuestro rango fisiologico @100 Hz:
+  // omega aprox 0.04..0.23 rad.
+  // Incluso con otros sampleInterval razonables sigue siendo
+  // suficientemente preciso para Goertzel.
+  float x2 =
+    radians *
+    radians;
+
+  float x4 =
+    x2 *
+    x2;
+
+  float x6 =
+    x4 *
+    x2;
+
+  return
+    1.0f -
+    x2 * 0.5f +
+    x4 * 0.0416666667f -
+    x6 * 0.0013888889f;
 }
 
 float PulseAPDS9008::clampFloat(

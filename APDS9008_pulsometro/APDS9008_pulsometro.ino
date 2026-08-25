@@ -1,354 +1,246 @@
+/*
+  APDS9008_HYBRID_3METHOD_v0.5.3 COOPERATIVE-HARMONIC
+
+  Experimental:
+  1) Peak / IBI
+  2) Autocorrelacion
+  3) Analisis espectral Fourier/Goertzel
+  4) Fusion 2-de-3
+
+  IMPORTANTE:
+  - bpm legado sigue siendo el metodo IBI.
+  - bpmFused es experimental.
+  - No hay WiFi / TCP / NodeDiscovery en este ejemplo.
+*/
+
 #include <Arduino.h>
 #include "PulseAPDS9008.h"
-
-// ============================================================
-// HARDWARE
-// ============================================================
 
 #define PULSE_PIN      2
 #define PULSE_LED_PIN  0
 
-// ============================================================
-// CONFIGURACION GENERAL
-// ============================================================
-
 const uint8_t PULSE_LED_POWER = 255;
-
-// 10 ms = 100 Hz.
 const uint16_t PULSE_SAMPLE_INTERVAL_MS = 10;
 
-// Guardrail fisiológico amplio.
-// NO representa un BPM esperado.
-const uint16_t PULSE_MIN_BPM = 35;
-const uint16_t PULSE_MAX_BPM = 220;
+// 0 = Monitor Serial
+// 1 = Plotter señal
+// 2 = Plotter BPM/metodos
+const uint8_t SERIAL_OUTPUT_MODE = 1;
 
-// Piso mínimo AC.
-const float PULSE_MIN_AMPLITUDE = 12.0f;
-
-// Estado general cada 500 ms.
 const uint32_t SERIAL_STATUS_INTERVAL_MS = 500;
 
-// ============================================================
-// SALIDA SERIAL
-// ============================================================
-//
-// false -> Monitor Serial normal.
-// true  -> Arduino Serial Plotter.
-//
-// IMPORTANTE:
-// Cuando SERIAL_PLOTTER_MODE=true no se imprimen textos de
-// diagnóstico, sólo series numéricas compatibles con Plotter.
-const bool SERIAL_PLOTTER_MODE = true;
+// El sensor sigue muestreando a 100 Hz. Solo reducimos la
+// cantidad de texto enviado al Plotter para evitar bloquear UART.
+const uint8_t SIGNAL_PLOTTER_DECIMATION = 2;   // ~50 Hz visible
+const uint32_t BPM_PLOTTER_INTERVAL_MS = 100;  // 10 Hz visible
 
-// Desplazamiento visual para superponer la señal AC alrededor
-// del mismo nivel del ADC RAW/DC sin usar valores negativos.
-const float PLOTTER_AC_CENTER = 2048.0f;
-
-// ============================================================
-// SENSOR
-// ============================================================
+const float PLOT_CENTER = 2048.0f;
 
 PulseAPDS9008 pulseSensor;
-
-// ============================================================
-// CONFIGURACION DEL SENSOR
-// ============================================================
 
 void configurePulseSensor() {
   PulseAPDS9008Config cfg;
 
-  cfg.signalPin =
-    PULSE_PIN;
+  cfg.signalPin = PULSE_PIN;
+  cfg.ledPin = PULSE_LED_PIN;
+  cfg.sampleIntervalMs = PULSE_SAMPLE_INTERVAL_MS;
 
-  cfg.ledPin =
-    PULSE_LED_PIN;
+  cfg.ledPower = PULSE_LED_POWER;
+  cfg.autoLedControl = false;
 
-  cfg.sampleIntervalMs =
-    PULSE_SAMPLE_INTERVAL_MS;
+  // Baseline CONTACT-GUARD validada.
+  cfg.minBpm = 35;
+  cfg.maxBpm = 220;
+  cfg.warmupMs = 1200;
+  cfg.minPulseAmplitude = 12.0f;
 
-  cfg.ledPower =
-    PULSE_LED_POWER;
+  cfg.dcAlpha = 0.005f;
+  cfg.signalAlpha = 0.25f;
+  cfg.envelopeAlpha = 0.035f;
+  cfg.noiseAlpha = 0.06f;
 
-  cfg.autoLedControl =
-    false;
+  cfg.envelopeThresholdFactor = 0.35f;
+  cfg.noiseThresholdFactor = 3.5f;
+  cfg.releaseFactor = 0.25f;
 
-  // --------------------------------------------------------
-  // GUARDRAIL FISIOLOGICO
-  // --------------------------------------------------------
+  cfg.prominenceFactor = 1.15f;
+  cfg.noiseProminenceFactor = 4.0f;
+  cfg.peakFallNoiseFactor = 1.25f;
+  cfg.minPeakFall = 3.0f;
+  cfg.fallingSamplesToConfirm = 2;
+  cfg.candidateTimeoutMs = 280;
 
-  cfg.minBpm =
-    PULSE_MIN_BPM;
+  cfg.contactAdcMin = 80;
+  cfg.contactAdcMax = 4015;
+  cfg.contactEnvelopeFactor = 0.35f;
+  cfg.contactMinEnvelope = 8.0f;
+  cfg.contactMinSnr = 3.5f;
+  cfg.contactMaxNoiseRatio = 0.30f;
+  cfg.contactConfirmMs = 850;
+  cfg.contactLostMs = 1300;
 
-  cfg.maxBpm =
-    PULSE_MAX_BPM;
+  cfg.motionRawJumpFloor = 90.0f;
+  cfg.motionAcFloor = 260.0f;
+  cfg.motionNoiseRatio = 0.55f;
+  cfg.motionConfirmSamples = 2;
+  cfg.motionHoldMs = 700;
 
-  cfg.warmupMs =
-    1200;
+  cfg.acquisitionSettleMs = 450;
+  cfg.acquisitionMinIbi = 4;
+  cfg.acquisitionTolerance = 0.22f;
 
-  cfg.minPulseAmplitude =
-    PULSE_MIN_AMPLITUDE;
+  cfg.highRateBpmThreshold = 120;
+  cfg.highRateAcquisitionMinIbi = 5;
 
-  // --------------------------------------------------------
-  // FILTRADO
-  // --------------------------------------------------------
+  cfg.trackingIbiTolerance = 0.25f;
+  cfg.dynamicRefractoryFactor = 0.52f;
 
-  cfg.dcAlpha =
-    0.005f;
+  cfg.beatRearmEnabled = true;
+  cfg.beatRearmMinAc = 4.0f;
+  cfg.beatRearmNoiseFactor = 1.0f;
 
-  cfg.signalAlpha =
-    0.25f;
+  cfg.reacquireMinIbi = 3;
+  cfg.reacquireTolerance = 0.22f;
+  cfg.maxConsecutiveOutliers = 5;
 
-  cfg.envelopeAlpha =
-    0.035f;
+  cfg.signalHoldMs = 1800;
 
-  cfg.noiseAlpha =
-    0.06f;
+  // ========================================================
+  // SISTEMA REDUNDANTE
+  // ========================================================
 
-  // --------------------------------------------------------
-  // DETECTOR DE PULSO
-  // --------------------------------------------------------
+  cfg.hybridEnabled = true;
 
-  cfg.envelopeThresholdFactor =
-    0.35f;
+  // 8 segundos maximo, comienza a estimar despues de 5.
+  cfg.hybridWindowMs = 8000;
+  cfg.hybridMinWindowMs = 5000;
+  cfg.hybridUpdateMs = 1000;
 
-  cfg.noiseThresholdFactor =
-    3.5f;
+  // Analisis cooperativo: no bloquear el muestreo de 10 ms.
+  cfg.hybridSliceBudgetUs = 1800;
 
-  cfg.releaseFactor =
-    0.25f;
+  // Barrido espectral grueso de 2 BPM + interpolacion.
+  cfg.hybridSpectralStepBpm = 2;
 
-  cfg.prominenceFactor =
-    1.15f;
+  // ADC/IBI = 100 Hz.
+  // Analizador CORR/SPEC = 25 Hz despues del filtro PPG.
+  cfg.hybridDecimation = 4;
 
-  cfg.noiseProminenceFactor =
-    4.0f;
+  // Banda PPG.
+  cfg.ppgHighpassHz = 0.60f;
+  cfg.ppgLowpassHz = 4.00f;
 
-  cfg.peakFallNoiseFactor =
-    1.25f;
+  cfg.autocorrMinQuality = 35;
+  cfg.spectralMinQuality = 35;
 
-  cfg.minPeakFall =
-    3.0f;
-
-  cfg.fallingSamplesToConfirm =
-    2;
-
-  cfg.candidateTimeoutMs =
-    280;
-
-  // --------------------------------------------------------
-  // CONTACTO OPTICO
-  // --------------------------------------------------------
-  //
-  // Más estricto que la versión básica anterior.
-  // No basta con tener envelope: también se exige buena
-  // relación señal/ruido.
-
-  cfg.contactAdcMin =
-    80;
-
-  cfg.contactAdcMax =
-    4015;
-
-  cfg.contactEnvelopeFactor =
-    0.35f;
-
-  cfg.contactMinEnvelope =
-    8.0f;
-
-  cfg.contactMinSnr =
-    3.5f;
-
-  cfg.contactMaxNoiseRatio =
-    0.30f;
-
-  cfg.contactConfirmMs =
-    850;
-
-  cfg.contactLostMs =
-    1300;
-
-  // --------------------------------------------------------
-  // MOVIMIENTO
-  // --------------------------------------------------------
-
-  cfg.motionRawJumpFloor =
-    90.0f;
-
-  cfg.motionAcFloor =
-    260.0f;
-
-  cfg.motionNoiseRatio =
-    0.55f;
-
-  cfg.motionConfirmSamples =
-    2;
-
-  cfg.motionHoldMs =
-    700;
-
-  // --------------------------------------------------------
-  // ADQUISICION
-  // --------------------------------------------------------
-
-  cfg.acquisitionSettleMs =
-    450;
-
-  cfg.acquisitionMinIbi =
-    4;
-
-  cfg.acquisitionTolerance =
-    0.22f;
-
-  // Si el cluster sugiere >=120 BPM se exige más evidencia.
-  cfg.highRateBpmThreshold =
-    120;
-
-  cfg.highRateAcquisitionMinIbi =
-    5;
-
-  // --------------------------------------------------------
-  // TRACKING
-  // --------------------------------------------------------
-
-  cfg.trackingIbiTolerance =
-    0.25f;
-
-  cfg.dynamicRefractoryFactor =
-    0.52f;
-
-  // --------------------------------------------------------
-  // REARME MORFOLOGICO
-  // --------------------------------------------------------
-  //
-  // Después de un pico, no se permite buscar otro hasta
-  // que la AC atraviese un valle negativo suficiente.
-
-  cfg.beatRearmEnabled =
-    true;
-
-  cfg.beatRearmMinAc =
-    4.0f;
-
-  cfg.beatRearmNoiseFactor =
-    1.0f;
-
-  // --------------------------------------------------------
-  // RE-ADQUISICION
-  // --------------------------------------------------------
-
-  cfg.reacquireMinIbi =
-    3;
-
-  cfg.reacquireTolerance =
-    0.22f;
-
-  cfg.maxConsecutiveOutliers =
-    5;
-
-  cfg.signalHoldMs =
-    1800;
+  cfg.fusionToleranceFraction = 0.10f;
+  cfg.fusionToleranceBpm = 6;
+  cfg.fusionMinConfidence = 55;
 
   pulseSensor.begin(cfg);
 }
-
-// ============================================================
-// PRINT DE EVENTO DE PULSO
-// ============================================================
 
 void printBeat(
   const PulseAPDS9008Data& p
 ) {
   Serial.printf(
-    "[PULSE] #%lu | state=%s | bpm=%u | ibi=%u ms | accepted=%s | "
-    "raw=%u | peak=%.1f | prom=%.1f | snr=%.2f | rearm=%s\n",
+    "[PULSE] #%lu state=%s bpmIBI=%u ibi=%u accepted=%s "
+    "peak=%.1f prom=%.1f\n",
     (unsigned long)p.beatCount,
     pulseSensor.stateName(),
-    p.bpm,
+    p.bpmIbi,
     p.ibiMs,
     p.ibiAccepted ? "YES" : "NO",
-    p.raw,
     p.peak,
-    p.prominence,
-    p.contactSnr,
-    p.beatRearmed ? "YES" : "NO"
+    p.prominence
   );
 }
 
-// ============================================================
-// PRINT PERIODICO
-// ============================================================
+const char* relationName(uint8_t relation) {
+  switch (relation) {
+    case 1: return "0.5x";
+    case 2: return "1x";
+    case 3: return "2x";
+    default: return "--";
+  }
+}
+
+void printHybrid(
+  const PulseAPDS9008Data& p
+) {
+  Serial.printf(
+    "[HYBRID] "
+    "IBI=%u Q=%u REL=%s | "
+    "CORR=%u Q=%u R=%.2f REL=%s | "
+    "SPEC=%u RAW=%u Q=%u DOM=%.1f H2=%.2f REL=%s | "
+    "FUSED=%u Q=%u METHODS=%u VALID=%s HARMONIC=%s RESOLVED=%s SCORE=%.1f "
+    "SAMPLES=%u CPU=%luus MAXCPU=%luus SLICE=%uus MAXSLICE=%uus CYCLE=%ums GAPMAX=%ums\n",
+
+    p.bpmIbi,
+    p.ibiMethodQuality,
+    relationName(p.ibiFusionRelation),
+
+    p.bpmAutocorr,
+    p.autocorrQuality,
+    p.autocorrStrength,
+    relationName(p.autocorrFusionRelation),
+
+    p.bpmSpectral,
+    p.bpmSpectralRawPeak,
+    p.spectralQuality,
+    p.spectralDominance,
+    p.spectralSecondHarmonicRatio,
+    relationName(p.spectralFusionRelation),
+
+    p.bpmFused,
+    p.fusionConfidence,
+    p.methodsAgree,
+    p.fusionValid ? "YES" : "NO",
+    p.harmonicSuspect ? "YES" : "NO",
+    p.harmonicResolved ? "YES" : "NO",
+    p.fusionScore,
+
+    p.hybridSamples,
+    (unsigned long)p.hybridAnalysisUs,
+    (unsigned long)p.hybridAnalysisMaxUs,
+    p.hybridSliceUs,
+    p.hybridSliceMaxUs,
+    p.hybridCycleElapsedMs,
+    p.sampleGapMaxMs
+  );
+}
 
 void printStatus(
   const PulseAPDS9008Data& p
 ) {
   Serial.printf(
-    "[PULSE-SIGNAL] "
-    "state=%s | contact=%s | motion=%s | "
-    "raw=%u | dc=%.1f | ac=%+.1f | env=%.1f | noise=%.1f | "
-    "snr=%.2f | rearm=%s | bpm=%u | stable=%s | "
-    "quality=%u | confidence=%u | led=%u\n",
+    "[SIGNAL] state=%s contact=%s motion=%s "
+    "raw=%u dc=%.1f ac=%+.1f ppg=%+.1f env=%.1f noise=%.1f "
+    "snr=%.2f bpmIBI=%u fused=%u valid=%s\n",
     pulseSensor.stateName(),
     p.contactLikely ? "YES" : "NO",
     p.motionDetected ? "YES" : "NO",
     p.raw,
     p.dc,
     p.ac,
+    p.ppgFiltered,
     p.envelope,
     p.noise,
     p.contactSnr,
-    p.beatRearmed ? "YES" : "NO",
-    p.bpm,
-    p.bpmStable ? "YES" : "NO",
-    p.quality,
-    p.confidence,
-    p.ledPower
+    p.bpmIbi,
+    p.bpmFused,
+    p.fusionValid ? "YES" : "NO"
   );
 }
 
-// ============================================================
-// SERIAL PLOTTER
-// ============================================================
-//
-// Series:
-//   RAW       -> ADC real.
-//   DC        -> baseline estimada.
-//   AC        -> componente pulsátil filtrada, centrada en 2048.
-//   ENV       -> envolvente, centrada en 2048.
-//   THR_POS   -> threshold positivo de detección.
-//   THR_NEG   -> espejo negativo del threshold para referencia.
-//   REARM     -> valle negativo mínimo requerido para rearmar.
-//
-// El detector inicia un candidato cuando AC supera THR_POS.
-// Después de un pico, el siguiente ciclo queda habilitado cuando
-// AC cae por debajo de REARM.
-//
-// Todas las trazas AC/ENV/THR/REARM se desplazan alrededor de
-// PLOTTER_AC_CENTER sólo para facilitar la visualización.
-
-void printPlotter(
+void printSignalPlotter(
   const PulseAPDS9008Data& p
 ) {
-  float rearmMagnitude =
-    p.noise;
+  float rearmMagnitude = p.noise;
 
   if (rearmMagnitude < 4.0f) {
     rearmMagnitude = 4.0f;
   }
-
-  float acPlot =
-    PLOTTER_AC_CENTER + p.ac;
-
-  float envPlot =
-    PLOTTER_AC_CENTER + p.envelope;
-
-  float thresholdPositive =
-    PLOTTER_AC_CENTER + p.threshold;
-
-  float thresholdNegative =
-    PLOTTER_AC_CENTER - p.threshold;
-
-  float rearmLevel =
-    PLOTTER_AC_CENTER - rearmMagnitude;
 
   Serial.print("RAW:");
   Serial.print(p.raw);
@@ -357,105 +249,91 @@ void printPlotter(
   Serial.print(p.dc, 1);
 
   Serial.print(",AC:");
-  Serial.print(acPlot, 1);
+  Serial.print(PLOT_CENTER + p.ac, 1);
+
+  Serial.print(",PPG:");
+  Serial.print(PLOT_CENTER + p.ppgFiltered, 1);
 
   Serial.print(",ENV:");
-  Serial.print(envPlot, 1);
+  Serial.print(PLOT_CENTER + p.envelope, 1);
 
-  Serial.print(",THR_POS:");
-  Serial.print(thresholdPositive, 1);
-
-  Serial.print(",THR_NEG:");
-  Serial.print(thresholdNegative, 1);
+  Serial.print(",THR:");
+  Serial.print(PLOT_CENTER + p.threshold, 1);
 
   Serial.print(",REARM:");
-  Serial.print(rearmLevel, 1);
+  Serial.print(PLOT_CENTER - rearmMagnitude, 1);
 
   Serial.println();
 }
 
-// ============================================================
-// SETUP
-// ============================================================
+void printBpmPlotter(
+  const PulseAPDS9008Data& p
+) {
+  Serial.print("IBI:");
+  Serial.print(p.bpmIbi);
+
+  Serial.print(",CORR:");
+  Serial.print(p.bpmAutocorr);
+
+  Serial.print(",SPEC:");
+  Serial.print(p.bpmSpectral);
+
+  Serial.print(",FUSED:");
+  Serial.print(p.bpmFused);
+
+  Serial.print(",FUSION_Q:");
+  Serial.print(p.fusionConfidence);
+
+  Serial.print(",VALID:");
+  Serial.print(
+    p.fusionValid ? 100 : 0
+  );
+
+  Serial.print(",HARMONIC:");
+  Serial.print(
+    p.harmonicSuspect ? 100 : 0
+  );
+
+  Serial.print(",RESOLVED:");
+  Serial.print(
+    p.harmonicResolved ? 100 : 0
+  );
+
+  Serial.println();
+}
 
 void setup() {
   Serial.begin(115200);
-
   delay(1000);
 
   analogReadResolution(12);
 
   configurePulseSensor();
 
-  if (!SERIAL_PLOTTER_MODE) {
+  if (SERIAL_OUTPUT_MODE == 0) {
     Serial.println();
-    Serial.println("==============================================================");
-    Serial.println(" APDS-9008 BASIC EXAMPLE v0.2.1 PLOTTER");
-    Serial.println("==============================================================");
-
-    Serial.printf(
-      "ADC APDS-9008       : GPIO%d\n",
-      PULSE_PIN
-    );
-
-    Serial.printf(
-      "LED verde           : GPIO%d\n",
-      PULSE_LED_PIN
-    );
-
-    Serial.printf(
-      "LED power           : %u / 255\n",
-      PULSE_LED_POWER
-    );
-
-    Serial.printf(
-      "Sampling            : %u Hz\n",
-      1000 / PULSE_SAMPLE_INTERVAL_MS
-    );
-
-    Serial.printf(
-      "BPM guardrail       : %u - %u\n",
-      PULSE_MIN_BPM,
-      PULSE_MAX_BPM
-    );
-
-    Serial.println(
-      "Contact SNR minimo  : 3.5"
-    );
-
-    Serial.println(
-      "IBI adquisicion     : 4"
-    );
-
-    Serial.println(
-      "IBI si BPM >=120    : 5"
-    );
-
-    Serial.println(
-      "Tracking tolerance  : +/-25%"
-    );
-
-    Serial.println(
-      "Serial Plotter mode : OFF"
-    );
-
+    Serial.println("============================================================");
+    Serial.println(" APDS-9008 HYBRID 3-METHOD v0.5.3 COOPERATIVE-HARMONIC");
+    Serial.println("============================================================");
+    Serial.println("1: Peak/IBI");
+    Serial.println("2: Autocorrelacion");
+    Serial.println("3: Fourier/Goertzel");
+    Serial.println("Fusion: familias armonicas 0.5x / 1x / 2x");
     Serial.println();
-    Serial.println(
-      "Estados: NO_CONTACT / ACQUIRING / TRACKING / MOTION"
-    );
-
-    Serial.println(
-      "Espere TRACKING + stable=YES para considerar BPM adquirido."
-    );
-
-    Serial.println("==============================================================");
+    Serial.println("PPG band: ~0.6-4 Hz");
+    Serial.println("Sensor/IBI: 100 Hz");
+    Serial.println("Hybrid CORR/SPEC: 25 Hz (decimation x4)");
+    Serial.println("Hybrid window: 8 s");
+    Serial.println("Hybrid starts: 5 s");
+    Serial.println("Hybrid update target: 1 s");
+    Serial.println("Hybrid CPU: cooperativo <= ~1.8 ms por muestra");
+    Serial.println("Spectral scan: 2 BPM + interpolacion");
+    Serial.println();
+    Serial.println("bpm legado NO ha sido reemplazado aun por bpmFused.");
+    Serial.println("============================================================");
     Serial.println();
   }
 }
-
-// ============================================================
-// LOOP
-// ============================================================
 
 void loop() {
   if (!pulseSensor.update()) {
@@ -465,23 +343,42 @@ void loop() {
   const PulseAPDS9008Data& p =
     pulseSensor.data();
 
-  // --------------------------------------------------------
-  // SERIAL PLOTTER
-  // --------------------------------------------------------
-  //
-  // El plotter recibe una línea en cada nueva muestra (~100 Hz)
-  // para conservar correctamente la forma de onda.
-  if (SERIAL_PLOTTER_MODE) {
-    printPlotter(p);
+  if (SERIAL_OUTPUT_MODE == 1) {
+    static uint8_t plotDivider = 0;
+
+    plotDivider++;
+
+    if (
+      plotDivider >=
+      SIGNAL_PLOTTER_DECIMATION
+    ) {
+      plotDivider = 0;
+      printSignalPlotter(p);
+    }
+
     return;
   }
 
-  // --------------------------------------------------------
-  // MONITOR SERIAL
-  // --------------------------------------------------------
+  if (SERIAL_OUTPUT_MODE == 2) {
+    static uint32_t lastBpmPlotMs = 0;
+
+    if (
+      millis() - lastBpmPlotMs >=
+      BPM_PLOTTER_INTERVAL_MS
+    ) {
+      lastBpmPlotMs = millis();
+      printBpmPlotter(p);
+    }
+
+    return;
+  }
 
   if (p.beat) {
     printBeat(p);
+  }
+
+  if (p.hybridUpdated) {
+    printHybrid(p);
   }
 
   static uint32_t lastStatusMs = 0;
@@ -490,9 +387,7 @@ void loop() {
     millis() - lastStatusMs >=
     SERIAL_STATUS_INTERVAL_MS
   ) {
-    lastStatusMs =
-      millis();
-
+    lastStatusMs = millis();
     printStatus(p);
   }
 }

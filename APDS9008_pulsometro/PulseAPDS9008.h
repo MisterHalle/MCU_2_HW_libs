@@ -153,6 +153,57 @@ struct PulseAPDS9008Config {
 
   // Signal/contact hold.
   uint16_t signalHoldMs = 1800;
+
+  // --------------------------------------------------------
+  // ANALISIS HIBRIDO REDUNDANTE
+  // --------------------------------------------------------
+
+  // Activa IBI + autocorrelacion + analisis espectral.
+  bool hybridEnabled = true;
+
+  // Ventana principal de analisis.
+  // A 100 Hz, 8000 ms = 800 muestras.
+  uint16_t hybridWindowMs = 8000;
+
+  // No se calcula correlacion/espectro antes de esta cantidad
+  // de historia valida.
+  uint16_t hybridMinWindowMs = 5000;
+
+  // Inicio de un nuevo ciclo de analisis. Si el ciclo anterior
+  // sigue activo, nunca se inicia otro encima.
+  uint16_t hybridUpdateMs = 1000;
+
+  // Presupuesto maximo aproximado de CPU dedicado al analizador
+  // cooperativo DESPUES de cada muestra ADC. La idea es volver al
+  // loop mucho antes de la siguiente muestra de 10 ms.
+  uint16_t hybridSliceBudgetUs = 1800;
+
+  // Paso del barrido espectral en BPM. 2 reduce aproximadamente
+  // a la mitad el trabajo; la estimacion final interpola el pico.
+  uint8_t hybridSpectralStepBpm = 2;
+
+  // Decimacion EXCLUSIVA del analizador hibrido.
+  // El ADC/IBI siguen a sampleIntervalMs (100 Hz por defecto).
+  // Como PPG ya esta limitada a ~4 Hz, 25 Hz conserva margen
+  // suficiente sobre Nyquist y reduce mucho la carga de CPU.
+  uint8_t hybridDecimation = 4;
+
+  // Filtro PPG adicional:
+  // high-pass ~0.6 Hz + low-pass ~4 Hz.
+  float ppgHighpassHz = 0.60f;
+  float ppgLowpassHz = 4.00f;
+
+  // Calidad minima para que un estimador participe en fusion.
+  uint8_t autocorrMinQuality = 35;
+  uint8_t spectralMinQuality = 35;
+
+  // Dos estimadores se consideran coincidentes si cumplen
+  // al menos una de estas tolerancias.
+  float fusionToleranceFraction = 0.10f;
+  uint8_t fusionToleranceBpm = 6;
+
+  // Confianza minima del consenso 2-de-3.
+  uint8_t fusionMinConfidence = 55;
 };
 
 struct PulseAPDS9008Data {
@@ -207,6 +258,67 @@ struct PulseAPDS9008Data {
   bool measurementValid = false;
   bool candidateActive = false;
 
+  // --------------------------------------------------------
+  // ANALISIS HIBRIDO
+  // --------------------------------------------------------
+
+  // PPG con banda aproximada 0.6-4 Hz.
+  float ppgFiltered = 0.0f;
+
+  // Metodo 1: peak/IBI legado.
+  uint16_t bpmIbi = 0;
+  uint8_t ibiMethodQuality = 0;
+
+  // Metodo 2: autocorrelacion.
+  uint16_t bpmAutocorr = 0;
+  uint8_t autocorrQuality = 0;
+  float autocorrStrength = 0.0f;
+
+  // Metodo 3: analisis espectral Fourier/Goertzel.
+  uint16_t bpmSpectral = 0;
+  uint16_t bpmSpectralRawPeak = 0;
+  uint8_t spectralQuality = 0;
+  float spectralDominance = 0.0f;
+  float spectralSecondHarmonicRatio = 0.0f;
+
+  // Consenso armonico.
+  uint16_t bpmFused = 0;
+  uint8_t fusionConfidence = 0;
+  uint8_t methodsAgree = 0;
+  float fusionScore = 0.0f;
+
+  // Relacion observada de cada metodo respecto a bpmFused:
+  // 0 = sin soporte
+  // 1 = 0.5x (subarmonico)
+  // 2 = 1x   (fundamental)
+  // 3 = 2x   (segundo armonico / doble frecuencia)
+  uint8_t ibiFusionRelation = 0;
+  uint8_t autocorrFusionRelation = 0;
+  uint8_t spectralFusionRelation = 0;
+
+  bool hybridReady = false;
+  bool hybridUpdated = false;
+  bool hybridBusy = false;
+  bool fusionValid = false;
+  bool harmonicSuspect = false;
+  bool harmonicResolved = false;
+
+  uint16_t hybridSamples = 0;
+
+  // Telemetria de rendimiento.
+  // hybridAnalysisUs: CPU acumulada del ultimo ciclo completo.
+  // hybridAnalysisMaxUs: peor CPU acumulada de un ciclo completo.
+  // hybridSliceUs: ultima rebanada cooperativa.
+  // hybridSliceMaxUs: peor rebanada cooperativa observada.
+  // hybridCycleElapsedMs: tiempo de pared desde inicio a fin del ciclo.
+  uint32_t hybridAnalysisUs = 0;
+  uint32_t hybridAnalysisMaxUs = 0;
+  uint16_t hybridSliceUs = 0;
+  uint16_t hybridSliceMaxUs = 0;
+  uint16_t hybridCycleElapsedMs = 0;
+  uint16_t sampleGapMs = 0;
+  uint16_t sampleGapMaxMs = 0;
+
   PulseMeasurementState state = PULSE_STATE_NO_CONTACT;
 };
 
@@ -244,9 +356,20 @@ public:
   void setMinPulseAmplitude(float amplitude);
   float minPulseAmplitude() const;
 
+  // Salidas experimentales del sistema redundante.
+  uint16_t fusedBpm() const;
+  uint8_t fusionConfidence() const;
+  bool fusionValid() const;
+
 private:
   static const uint8_t IBI_BUFFER_SIZE = 7;
   static const uint8_t ACQ_BUFFER_SIZE = 6;
+
+  // Limite fisico del buffer hibrido. El analizador se decima
+  // por defecto a 25 Hz: 8 s utilizan ~200 muestras.
+  static const uint16_t HYBRID_BUFFER_MAX = 800;
+  static const uint16_t CORR_LAG_MAX = 400;
+  static const uint16_t SPECTRAL_BPM_MAX = 250;
 
   PulseAPDS9008Config _cfg;
   PulseAPDS9008Data _data;
@@ -306,6 +429,61 @@ private:
 
   uint16_t _reacqBuffer[ACQ_BUFFER_SIZE] = {0};
   uint8_t _reacqCount = 0;
+
+  // --------------------------------------------------------
+  // ANALIZADOR HIBRIDO COOPERATIVO
+  // --------------------------------------------------------
+
+  enum HybridWorkStage : uint8_t {
+    HYBRID_WORK_IDLE = 0,
+    HYBRID_WORK_CORRELATION,
+    HYBRID_WORK_PREPARE_SPECTRUM,
+    HYBRID_WORK_SPECTRUM,
+    HYBRID_WORK_FINALIZE
+  };
+
+  float _hybridBuffer[HYBRID_BUFFER_MAX] = {0.0f};
+  uint16_t _hybridWrite = 0;
+  uint16_t _hybridCount = 0;
+  uint16_t _hybridTargetSamples = HYBRID_BUFFER_MAX;
+  uint16_t _hybridMinSamples = 500;
+  uint16_t _hybridSampleIntervalMs = 40;
+  uint8_t _hybridDecimationCounter = 0;
+
+  // Snapshot inmutable del ciclo en curso. Evita que el ring buffer
+  // cambie mientras CORR/SPEC se calculan en varios ciclos del loop.
+  float _analysisBuffer[HYBRID_BUFFER_MAX] = {0.0f};
+  float _corrScores[CORR_LAG_MAX + 1] = {0.0f};
+  float _spectralPowers[SPECTRAL_BPM_MAX + 1] = {0.0f};
+
+  HybridWorkStage _hybridWorkStage = HYBRID_WORK_IDLE;
+  bool _hybridAnalysisInProgress = false;
+
+  uint16_t _analysisCount = 0;
+  uint16_t _corrMinLag = 0;
+  uint16_t _corrMaxLag = 0;
+  uint16_t _corrCurrentLag = 0;
+  float _corrGlobalBest = 0.0f;
+  uint16_t _corrGlobalLag = 0;
+
+  uint16_t _spectralMinBpm = 0;
+  uint16_t _spectralMaxBpm = 0;
+  uint16_t _spectralCurrentBpm = 0;
+  float _spectralRawBestPower = 0.0f;
+  uint16_t _spectralRawBestBpm = 0;
+  float _spectralSumPower = 0.0f;
+  uint16_t _spectralPowerCount = 0;
+
+  uint32_t _lastHybridAnalysisMs = 0;
+  uint32_t _analysisStartedMs = 0;
+  uint32_t _analysisCpuAccumUs = 0;
+
+  bool _ppgInitialized = false;
+  float _ppgPreviousInput = 0.0f;
+  float _ppgHighpass = 0.0f;
+  float _ppgLowpass = 0.0f;
+  float _ppgHighpassAlpha = 0.96367f;
+  float _ppgLowpassAlpha = 0.20085f;
 
   void processSample(uint16_t raw, uint32_t nowMs);
 
@@ -400,12 +578,42 @@ private:
 
   void updateConfidence();
 
+  // Hibrido.
+  void configureHybridAnalyzer();
+  void resetHybridAnalyzer();
+  void updatePpgBandpass(float input);
+  void pushHybridSample(float value);
+  float hybridSampleAt(uint16_t chronologicalIndex) const;
+
+  void maybeRunHybridAnalysis(uint32_t nowMs);
+  void startHybridAnalysis(uint32_t nowMs);
+  void serviceHybridAnalysis(uint32_t nowMs);
+  void finishHybridAnalysis(uint32_t nowMs);
+
+  void processOneAutocorrelationLag();
+  void finalizeAutocorrelation();
+  void processOneSpectralBin();
+  void finalizeSpectral();
+
+  float goertzelPowerAnalysis(uint16_t bpm) const;
+  float spectralPowerNear(uint16_t bpm) const;
+
+  void updateFusion();
+  bool bpmAgreement(uint16_t a, uint16_t b) const;
+  uint8_t relationToHypothesis(
+    uint16_t observedBpm,
+    uint16_t hypothesisBpm,
+    float& supportFactor
+  ) const;
+
   void applyLedPower();
 
   // Valor absoluto local para evitar depender directamente
   // de <math.h> en proyectos Arduino con posibles colisiones
   // de nombres de headers.
   static float absFloat(float value);
+  static float fastSqrt(float value);
+  static float fastCosSmall(float radians);
 
   static float clampFloat(
     float value,
